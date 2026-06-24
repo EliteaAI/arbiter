@@ -20,6 +20,7 @@
 """
 
 import time
+import queue
 import base64
 
 import socketio  # pylint: disable=E0401
@@ -39,8 +40,13 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
             ssl_verify=False, socketio_path="socket.io",
             log_errors=True,
             retry_interval=3.0,
+            emitting_workers=1,
     ):  # pylint: disable=R0913
-        super().__init__(hmac_key, hmac_digest, callback_workers, log_errors)
+        super().__init__(
+            hmac_key, hmac_digest, callback_workers, log_errors,
+            use_emit_queue=True,
+            emitting_workers=emitting_workers,
+        )
         #
         self.clone_config = {
             "type": "SocketIOEventNode",
@@ -56,6 +62,7 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
             "socketio_path": socketio_path,
             "log_errors": log_errors,
             "retry_interval": retry_interval,
+            "emitting_workers": emitting_workers,
         }
         #
         self.sio_config = {
@@ -92,11 +99,25 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
 
     def emit_data(self, data):
         """ Emit event data """
-        with self.event_lock:
-            if self.data_base64:
-                data = base64.b64encode(data).decode()
-            #
-            self.sio.emit("eventnode_event", data)
+        if self.data_base64:
+            data = base64.b64encode(data).decode()
+        #
+        self.sio.emit("eventnode_event", data)
+
+    def emitting_worker(self):
+        """ Emitting thread: emit event data from emit_queue """
+        while self.running:
+            try:
+                data = self.emit_queue.get(timeout=self.queue_get_timeout)
+                #
+                self.emit_data(data)
+            except queue.Empty:
+                pass
+            except:  # pylint: disable=W0702
+                if self.log_errors:
+                    log.exception("Error during event emitting, skipping")
+        #
+        log.debug("SocketIO emitting thread exiting")
 
     def listening_worker(self):
         """ Listening thread: push event data to sync_queue """
@@ -135,11 +156,10 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
                     socketio_path=self.sio_config["socketio_path"],
                 )
                 #
-                with self.event_lock:
-                    sio.emit("eventnode_join", {
-                        "password": self.sio_config["password"],
-                        "room": self.sio_config["room"],
-                    })
+                sio.emit("eventnode_join", {
+                    "password": self.sio_config["password"],
+                    "room": self.sio_config["room"],
+                })
                 #
                 return sio
             except:  # pylint: disable=W0702
