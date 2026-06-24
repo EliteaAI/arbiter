@@ -40,12 +40,10 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
             ssl_verify=False, socketio_path="socket.io",
             log_errors=True,
             retry_interval=3.0,
-            emitting_workers=1,
     ):  # pylint: disable=R0913
         super().__init__(
             hmac_key, hmac_digest, callback_workers, log_errors,
-            use_emit_queue=True,
-            emitting_workers=emitting_workers,
+            use_emit_queue=True, emitting_workers=1,
         )
         #
         self.clone_config = {
@@ -62,7 +60,6 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
             "socketio_path": socketio_path,
             "log_errors": log_errors,
             "retry_interval": retry_interval,
-            "emitting_workers": emitting_workers,
         }
         #
         self.sio_config = {
