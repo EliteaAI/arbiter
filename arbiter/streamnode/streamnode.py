@@ -189,10 +189,10 @@ class StreamNode:  # pylint: disable=R0902,R0904
 
     def generate_stream_id(self):
         """ Get 'mostly' safe new stream_id """
-        with self.lock:
-            while True:
-                stream_id = f"{self.id_prefix}{str(uuid.uuid4())}"
-                #
+        while True:
+            stream_id = f"{self.id_prefix}{str(uuid.uuid4())}"
+            #
+            with self.lock:
                 if stream_id in self.streams:
                     continue
                 #
