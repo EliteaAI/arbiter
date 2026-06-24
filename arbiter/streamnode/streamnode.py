@@ -94,8 +94,10 @@ class StreamNode:  # pylint: disable=R0902,R0904
         if stream_id is None:
             stream_id = self.generate_stream_id()
         #
+        stream_queue = queue.SimpleQueue()
+        #
         with self.lock:
-            self.streams[stream_id] = queue.SimpleQueue()
+            self.streams[stream_id] = stream_queue
         #
         return stream_id
 
@@ -103,14 +105,14 @@ class StreamNode:  # pylint: disable=R0902,R0904
         """ Destroy stream """
         with self.lock:
             stream = self.streams.pop(stream_id, None)
-            #
-            if stream is None:
-                return
-            #
-            stream.put({
-                "type": "stream_end",
-                "data": None,
-            })
+        #
+        if stream is None:
+            return
+        #
+        stream.put({
+            "type": "stream_end",
+            "data": None,
+        })
 
     #
     # Stream changes
@@ -195,8 +197,8 @@ class StreamNode:  # pylint: disable=R0902,R0904
             with self.lock:
                 if stream_id in self.streams:
                     continue
-                #
-                break
+            #
+            break
         #
         return stream_id
 
