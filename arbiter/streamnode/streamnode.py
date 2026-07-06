@@ -109,6 +109,11 @@ class StreamNode:  # pylint: disable=R0902,R0904
         if stream is None:
             return
         #
+        # Put a stream_end sentinel so any consumer that is currently blocked
+        # on stream.get() wakes up and exits cleanly.  The queue object stays
+        # alive until the consumer drains it; the dict entry is already gone
+        # so on_stream_event will silently drop any further events for this
+        # stream_id (which is the desired behaviour).
         stream.put({
             "type": "stream_end",
             "data": None,
@@ -180,10 +185,16 @@ class StreamNode:  # pylint: disable=R0902,R0904
         #
         stream_id = event.pop("stream_id", None)
         #
-        if stream_id not in self.streams:
+        # Fix: grab the queue reference under the lock so the check and the
+        # lookup are atomic with respect to remove_stream().  SimpleQueue.put
+        # itself is thread-safe and does not need the lock.
+        with self.lock:
+            stream = self.streams.get(stream_id)
+        #
+        if stream is None:
             return
         #
-        self.streams[stream_id].put(event)
+        stream.put(event)
 
     #
     # Tools
@@ -191,14 +202,14 @@ class StreamNode:  # pylint: disable=R0902,R0904
 
     def generate_stream_id(self):
         """ Get 'mostly' safe new stream_id """
+        # Fix: hold the lock for the full check-then-break so we never return
+        # an ID that another thread is about to register.
         while True:
             stream_id = f"{self.id_prefix}{str(uuid.uuid4())}"
             #
             with self.lock:
-                if stream_id in self.streams:
-                    continue
-            #
-            break
+                if stream_id not in self.streams:
+                    break
         #
         return stream_id
 

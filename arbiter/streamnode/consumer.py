@@ -61,7 +61,14 @@ class StreamConsumer:  # pylint: disable=R0902,R0904
     def __iter__(self):
         """ Consume """
         try:
-            stream = self.stream_node.streams[self.stream_id]
+            # Fix: grab the queue reference under the lock so we never race
+            # with a concurrent remove_stream() that pops the entry first.
+            with self.stream_node.lock:
+                stream = self.stream_node.streams.get(self.stream_id)
+            #
+            if stream is None:
+                # Stream was already removed before we started iterating.
+                return
             #
             while True:
                 event = stream.get(timeout=self.timeout)
