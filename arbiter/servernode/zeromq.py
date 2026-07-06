@@ -84,6 +84,7 @@ class ZeroMQServerNode:  # pylint: disable=R0902,R0904
         self.sockopt_heartbeat_timeout = sockopt_heartbeat_timeout
         #
         self.stop_event = threading.Event()
+        self.bound_event = threading.Event()
         self.started = False
         #
         self.zmq_ctx = None
@@ -107,8 +108,15 @@ class ZeroMQServerNode:  # pylint: disable=R0902,R0904
         #
         self.zmq_ctx = zmq.Context()
         #
+        self.bound_event.clear()
         self.zmq_server_thread = ZeroMQServerThread(self)
         self.zmq_server_thread.start()
+        #
+        # Wait until both sockets are actually bound before returning.
+        # Without this, callers (e.g. init.py) may spawn gate/host subprocesses
+        # before the IPC socket files exist, causing repeated "not connected"
+        # warnings and a multi-second startup delay.
+        self.bound_event.wait()
         #
         self.started = True
         #
@@ -220,6 +228,9 @@ class ZeroMQServerThread(threading.Thread):  # pylint: disable=R0903
         zmq_socket_pull.bind(self.node.bind_pull)
         zmq_poller = zmq.Poller()  # pylint: disable=E1101
         zmq_poller.register(zmq_socket_pull, zmq.POLLIN)
+        #
+        # Signal that both sockets are bound and the IPC files exist.
+        self.node.bound_event.set()
         shutdown_deadline = None
         shutdown_last_activity = None
         #

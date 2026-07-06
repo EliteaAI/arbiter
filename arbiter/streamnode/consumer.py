@@ -20,6 +20,8 @@
     Stream tools
 """
 
+import threading
+
 from arbiter import log
 
 
@@ -35,28 +37,31 @@ class StreamConsumer:  # pylint: disable=R0902,R0904
         self.timeout = timeout
         #
         self.oob_handlers = {}
+        self.oob_handlers_lock = threading.Lock()
 
     def register_oob_handler(self, tag=None, handler=None):
         """ OOB """
         if handler is None:
             return
         #
-        if tag not in self.oob_handlers:
-            self.oob_handlers[tag] = []
-        #
-        if handler not in self.oob_handlers[tag]:
-            self.oob_handlers[tag].append(handler)
+        with self.oob_handlers_lock:
+            if tag not in self.oob_handlers:
+                self.oob_handlers[tag] = []
+            #
+            if handler not in self.oob_handlers[tag]:
+                self.oob_handlers[tag].append(handler)
 
     def unregister_oob_handler(self, tag=None, handler=None):
         """ OOB """
         if handler is None:
             return
         #
-        if tag not in self.oob_handlers:
-            return
-        #
-        if handler in self.oob_handlers[tag]:
-            self.oob_handlers[tag].remove(handler)
+        with self.oob_handlers_lock:
+            if tag not in self.oob_handlers:
+                return
+            #
+            if handler in self.oob_handlers[tag]:
+                self.oob_handlers[tag].remove(handler)
 
     def __iter__(self):
         """ Consume """
@@ -86,7 +91,10 @@ class StreamConsumer:  # pylint: disable=R0902,R0904
                     oob_tag = event_data.get("tag", None)
                     oob_payload = event_data.get("payload", None)
                     #
-                    for handler in self.oob_handlers.get(oob_tag, []):
+                    with self.oob_handlers_lock:
+                        handlers = list(self.oob_handlers.get(oob_tag, []))
+                    #
+                    for handler in handlers:
                         try:
                             handler(oob_tag, oob_payload)
                         except:  # pylint: disable=W0702
