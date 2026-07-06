@@ -267,13 +267,18 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
         #
         zmq_socket_push = self.zmq_ctx.socket(zmq.PUSH)  # pylint: disable=E1101
         self._set_sockopts(zmq, zmq_socket_push)
-        zmq_socket_push.connect(self.zeromq_connect_push)
         #
+        # Fix: attach the monitor BEFORE connect() — same race as in
+        # listening_worker: the handshake can complete before the monitor is
+        # attached if connect() is called first, causing the ready event to
+        # never be set.
         zmq_socket_monitor = zmq_socket_push.get_monitor_socket()
         zmq_monitor_thread = ZeroMQMonitorThread(
             self, zmq_socket_monitor, self.emitting_ready_event
         )
         zmq_monitor_thread.start()
+        #
+        zmq_socket_push.connect(self.zeromq_connect_push)
         #
         while self.running:
             wait_result = self.emitting_ready_event.wait(self.connection_wait_interval)
@@ -316,16 +321,24 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
         #
         zmq_socket_sub = self.zmq_ctx.socket(zmq.SUB)  # pylint: disable=E1101
         self._set_sockopts(zmq, zmq_socket_sub)
-        zmq_socket_sub.connect(self.zeromq_connect_sub)
-        zmq_socket_sub.subscribe(self.zeromq_topic)
-        zmq_poller = zmq.Poller()  # pylint: disable=E1101
-        zmq_poller.register(zmq_socket_sub, zmq.POLLIN)
         #
+        # Fix: attach the monitor BEFORE connect() so we never miss
+        # EVENT_HANDSHAKE_SUCCEEDED.  If connect() is called first the
+        # handshake can complete in the window before get_monitor_socket()
+        # returns; the event is generated on the socket's internal stream
+        # before the monitor is attached and is silently discarded — the
+        # monitor thread then blocks in poll() forever waiting for an event
+        # that already happened, causing the "not connected yet" loop.
         zmq_socket_monitor = zmq_socket_sub.get_monitor_socket()
         zmq_monitor_thread = ZeroMQMonitorThread(
             self, zmq_socket_monitor, self.listening_ready_event
         )
         zmq_monitor_thread.start()
+        #
+        zmq_socket_sub.connect(self.zeromq_connect_sub)
+        zmq_socket_sub.subscribe(self.zeromq_topic)
+        zmq_poller = zmq.Poller()  # pylint: disable=E1101
+        zmq_poller.register(zmq_socket_sub, zmq.POLLIN)
         #
         while self.running:
             wait_result = self.listening_ready_event.wait(self.connection_wait_interval)
