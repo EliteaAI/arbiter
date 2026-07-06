@@ -73,7 +73,13 @@ class StreamConsumer:  # pylint: disable=R0902,R0904
             #
             if stream is None:
                 # Stream was already removed before we started iterating.
-                return
+                # Raise RuntimeError rather than returning silently: a silent
+                # return causes the generator to raise StopIteration at the
+                # first next() call, which is indistinguishable from a normal
+                # empty stream and leads to confusing errors in callers.
+                raise RuntimeError(
+                    f"Stream {self.stream_id!r} was removed before iteration started"
+                )
             #
             while True:
                 event = stream.get(timeout=self.timeout)

@@ -66,6 +66,10 @@ class StreamNode:  # pylint: disable=R0902,R0904
             self.event_node_was_started = True
         #
         self.event_node.subscribe("stream_event", self.on_stream_event)
+        # Stream events must be delivered strictly in order (chunk... end):
+        # request inline dispatch so the bus does not reorder them across
+        # per-event threads.  on_stream_event is a non-blocking queue put.
+        self.event_node.register_inline_dispatch_event("stream_event")
         #
         self.started = True
         #
@@ -75,6 +79,7 @@ class StreamNode:  # pylint: disable=R0902,R0904
     def stop(self):
         """ Stop task node """
         self.event_node.unsubscribe("stream_event", self.on_stream_event)
+        self.event_node.unregister_inline_dispatch_event("stream_event")
         #
         for stream_id in list(self.streams):
             self.remove_stream(stream_id)
