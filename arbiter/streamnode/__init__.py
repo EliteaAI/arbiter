@@ -18,3 +18,5 @@
 
 
 from .streamnode import StreamNode
+from .asyncio import AsyncStreamNode
+from .asyncio_consumer import AsyncStreamConsumer

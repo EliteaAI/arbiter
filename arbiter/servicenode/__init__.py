@@ -17,3 +17,4 @@
 #   limitations under the License.
 
 from .servicenode import ServiceNode
+from .asyncio import AsyncServiceNode
