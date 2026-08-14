@@ -41,7 +41,7 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
         while not self.node.stop_event.is_set():
             time.sleep(self.node.housekeeping_interval)
             #
-            if self.node.reverify_orphan_tasks:
+            if self.node.state_reply_authority:
                 try:
                     self.reverify_orphans()
                 except:  # pylint: disable=W0702
