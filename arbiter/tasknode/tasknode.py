@@ -61,6 +61,8 @@ class TaskNode:  # pylint: disable=R0902,R0904
             tmp_path="/tmp/tasknode", result_transport="memory",
             start_attempts=3, thread_scan_interval=1,
             task_approver=None,
+            reverify_orphan_tasks=False, orphan_grace_period=300,
+            orphan_batch_limit=1000,
     ):
         self.event_node = event_node
         self.event_node_was_started = False
@@ -92,6 +94,9 @@ class TaskNode:  # pylint: disable=R0902,R0904
         self.result_transport = result_transport
         #
         self.housekeeping_interval = housekeeping_interval
+        self.reverify_orphan_tasks = reverify_orphan_tasks
+        self.orphan_grace_period = orphan_grace_period
+        self.orphan_batch_limit = orphan_batch_limit
         self.start_max_wait = start_max_wait
         self.query_wait = query_wait
         self.watcher_max_wait = watcher_max_wait
