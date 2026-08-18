@@ -33,8 +33,8 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
         super().__init__(daemon=True)
         self.node = node
         self.orphan_first_seen = {}
-        self.replies = {}
         self.replies_lock = threading.Lock()
+        self.active_pass = None
 
     def run(self):
         """ Run housekeeper thread """
@@ -72,20 +72,32 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
 
     def reverify_orphans(self):
         """ Re-ask the bus about non-local rows that pruning can never reach """
-        suspects = self._collect_suspects()
+        suspects, snapshot = self._collect_suspects()
+        #
+        with self.replies_lock:
+            # Drop any collector a previous pass left behind, so late callbacks
+            # cannot keep task-state payloads reachable once their pass is over
+            self.active_pass = None
         #
         if not suspects:
             return
         #
         # Several nodes may answer one query and global_task_state keeps only the
         # last, so replies are collected as they arrive instead of read back after
+        current_pass = {
+            "expected": set(suspects),
+            "replies": {},
+            "closed": False,
+        }
+        #
         with self.replies_lock:
-            self.replies = {}
+            self.active_pass = current_pass
         #
         self.node.event_node.subscribe("task_state_announce", self.on_reverify_reply)
         #
         try:
-            # Emits are non-blocking, so one wait covers the whole batch
+            # Emits are non-blocking to us, but the Redis transport publishes once
+            # per call, so orphan_batch_limit is what actually bounds a pass
             for task_id in suspects:
                 self.node.event_node.emit(
                     "task_state_query",
@@ -97,18 +109,23 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
             #
             time.sleep(self.node.query_wait)
         finally:
-            self.node.event_node.unsubscribe("task_state_announce", self.on_reverify_reply)
-            #
+            # Close before unsubscribing: unsubscribe is not a barrier for callbacks
+            # already selected for dispatch, so they must find the pass closed
             with self.replies_lock:
-                replies = self.replies
-                self.replies = {}
+                current_pass["closed"] = True
+                self.active_pass = None
+                replies = current_pass["replies"]
+            #
+            self.node.event_node.unsubscribe("task_state_announce", self.on_reverify_reply)
         #
         for task_id in suspects:
             if self._owner_replied(replies.get(task_id, [])):
                 self.orphan_first_seen.pop(task_id, None)
                 continue
             #
-            self._retire(task_id)
+            if not self._retire(task_id, snapshot[task_id]):
+                # Refused: give it a fresh grace period instead of retrying at once
+                self.orphan_first_seen[task_id] = time.time()
 
     def on_reverify_reply(self, event_name, event_payload):
         """ Collect targeted-query answers addressed to us """
@@ -123,20 +140,36 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
             return
         #
         with self.replies_lock:
-            self.replies.setdefault(task_id, []).append(event_payload)
+            current_pass = self.active_pass
+            #
+            if current_pass is None or current_pass["closed"]:
+                return
+            #
+            if task_id not in current_pass["expected"]:
+                return
+            #
+            current_pass["replies"].setdefault(task_id, []).append(event_payload)
 
     def _collect_suspects(self):
         """ Non-local unfinished rows that have outlived the grace period """
         now = time.time()
         suspects = []
+        snapshot = {}
         #
         with self.node.lock:
-            candidates = [
-                task_id for task_id, state in self.node.global_task_state.items()
-                if task_id not in self.node.running_tasks
-                and task_id not in self.node.local_tasks
-                and state.get("status", "unknown") != "stopped"
-            ]
+            candidates = []
+            #
+            for task_id, state in self.node.global_task_state.items():
+                if task_id in self.node.running_tasks or task_id in self.node.local_tasks:
+                    continue
+                #
+                status = state.get("status", "unknown")
+                #
+                if status == "stopped":
+                    continue
+                #
+                candidates.append(task_id)
+                snapshot[task_id] = status
         #
         for task_id in list(self.orphan_first_seen):
             if task_id not in candidates:
@@ -164,7 +197,7 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
                 len(suspects), len(candidates) - len(suspects),
             )
         #
-        return suspects
+        return suspects, snapshot
 
     def _owner_replied(self, replies):
         """ True if a node with authority over this task answered our query """
@@ -184,15 +217,48 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
         #
         return False
 
+    def _drop_locked(self, task_id):
+        """ Forget a task locally. Caller must hold node.lock """
+        self.node.state_events.pop(task_id, None)
+        self.node.global_task_state.pop(task_id, None)
+        self.node.known_task_ids.discard(task_id)
+
     def _prune(self, task_id):
         """ Drop all local trace of a task and tell the bus """
         with self.node.lock:
-            self.node.state_events.pop(task_id, None)
-            self.node.global_task_state.pop(task_id, None)
-            self.node.known_task_ids.discard(task_id)
+            self._drop_locked(task_id)
         #
         self.orphan_first_seen.pop(task_id, None)
+        self._emit_pruned(task_id)
+
+    def _retire(self, task_id, expected_status):
+        """ Drop an unclaimed row, unless it came back to life while we queried """
+        with self.node.lock:
+            # The query wait is long enough for this node to be handed the task,
+            # and dropping the row then would strand it in local/running_tasks
+            if task_id in self.node.running_tasks or task_id in self.node.local_tasks:
+                log.info("Not retiring %s: task became local while querying", task_id)
+                return False
+            #
+            state = self.node.global_task_state.get(task_id, None)
+            #
+            if state is None:
+                return False
+            #
+            if state.get("status", "unknown") != expected_status:
+                log.info("Not retiring %s: state changed while querying", task_id)
+                return False
+            #
+            log.warning("Retiring orphaned task state: %s", task_id)
+            self._drop_locked(task_id)
         #
+        self.orphan_first_seen.pop(task_id, None)
+        self._emit_pruned(task_id)
+        #
+        return True
+
+    def _emit_pruned(self, task_id):
+        """ Tell the bus we no longer track this task """
         self.node.event_node.emit(
             "task_status_change",
             {
@@ -200,7 +266,3 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
                 "status": "pruned",
             }
         )
-
-    def _retire(self, task_id):
-        log.warning("Retiring orphaned task state: %s", task_id)
-        self._prune(task_id)

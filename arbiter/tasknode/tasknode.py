@@ -62,7 +62,7 @@ class TaskNode:  # pylint: disable=R0902,R0904
             start_attempts=3, thread_scan_interval=1,
             task_approver=None,
             state_reply_authority=False, orphan_grace_period=300,
-            orphan_batch_limit=1000,
+            orphan_batch_limit=300,
     ):
         self.event_node = event_node
         self.event_node_was_started = False
@@ -619,10 +619,13 @@ class TaskNode:  # pylint: disable=R0902,R0904
         if event_payload.get("task_id", None) is not None:
             task_id = event_payload.get("task_id")
             #
-            if task_id not in self.global_task_state:
+            # Single read: housekeeping can retire the row between a check and a get
+            known_state = self.global_task_state.get(task_id, None)
+            #
+            if known_state is None:
                 return
             #
-            task_state = self.global_task_state[task_id].copy()
+            task_state = known_state.copy()
             task_state["for_requestor"] = event_payload.get("requestor", None)
             #
             self.announce_task_state(task_state)
