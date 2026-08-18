@@ -47,6 +47,8 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
                 except:  # pylint: disable=W0702
                     log.exception("Orphan reverify failed, continuing")
             #
+            expired = []
+            #
             with self.node.lock:
                 for task_id in list(self.node.state_events):
                     data = self.node.state_events[task_id]
@@ -59,17 +61,10 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
                     if age < self.node.task_retention_period:
                         continue
                     #
-                    self.node.state_events.pop(task_id, None)
-                    self.node.global_task_state.pop(task_id, None)
-                    self.node.known_task_ids.discard(task_id)
-                    #
-                    self.node.event_node.emit(
-                        "task_status_change",
-                        {
-                            "task_id": task_id,
-                            "status": "pruned",
-                        }
-                    )
+                    expired.append(task_id)
+            #
+            for task_id in expired:
+                self._prune(task_id)
 
     #
     # Orphan reverify: retire rows nobody on the bus still owns
@@ -147,6 +142,8 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
             if task_id not in candidates:
                 self.orphan_first_seen.pop(task_id, None)
         #
+        capped = False
+        #
         for task_id in candidates:
             first_seen = self.orphan_first_seen.setdefault(task_id, now)
             #
@@ -156,7 +153,16 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
             suspects.append(task_id)
             #
             if len(suspects) >= self.node.orphan_batch_limit:
+                capped = True
                 break
+        #
+        if capped:
+            # Retired rows leave global_task_state, so the remainder moves up next
+            # pass: this drains over several passes rather than starving anyone
+            log.warning(
+                "Orphan reverify hit batch limit: %s suspects this pass, %s candidates remain",
+                len(suspects), len(candidates) - len(suspects),
+            )
         #
         return suspects
 
@@ -178,15 +184,14 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
         #
         return False
 
-    def _retire(self, task_id):
+    def _prune(self, task_id):
+        """ Drop all local trace of a task and tell the bus """
         with self.node.lock:
             self.node.state_events.pop(task_id, None)
             self.node.global_task_state.pop(task_id, None)
             self.node.known_task_ids.discard(task_id)
         #
         self.orphan_first_seen.pop(task_id, None)
-        #
-        log.warning("Retiring orphaned task state: %s", task_id)
         #
         self.node.event_node.emit(
             "task_status_change",
@@ -195,3 +200,7 @@ class TaskNodeHousekeeper(threading.Thread):  # pylint: disable=R0903
                 "status": "pruned",
             }
         )
+
+    def _retire(self, task_id):
+        log.warning("Retiring orphaned task state: %s", task_id)
+        self._prune(task_id)
