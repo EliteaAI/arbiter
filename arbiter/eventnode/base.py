@@ -203,7 +203,10 @@ class EventNodeBase:  # pylint: disable=R0902
                 #
                 self.stop_event.wait(self._retry_sleep(deadline))
         #
-        return None
+        # Never return a missing connection: callers would treat None as usable
+        raise EventNodeStartTimeout(
+            f"{type(self).__name__}: {source} gave up, node stopped before it succeeded"
+        )
 
     def _wait_until_ready(self, worker_kind, ready_event, deadline):
         """ Wait for worker readiness, raise instead of blocking forever """
@@ -244,11 +247,14 @@ class EventNodeBase:  # pylint: disable=R0902
 
     def _describe_error(self, source):
         """ Describe the error recorded for source, without attributing another one to it """
-        if source in self.worker_errors:
-            return self.worker_errors[source]
+        # Snapshot: retrying workers keep recording while this formats
+        errors = dict(self.worker_errors)
         #
-        if self.worker_errors:
-            others = ", ".join(f"{key}: {value}" for key, value in self.worker_errors.items())
+        if source in errors:
+            return errors[source]
+        #
+        if errors:
+            others = ", ".join(f"{key}: {value}" for key, value in errors.items())
             return f"none from {source}, other errors: {others}"
         #
         return "no error recorded, worker still blocked"

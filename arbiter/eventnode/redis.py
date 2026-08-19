@@ -125,11 +125,15 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
 
     def _close_transport(self):
         """ Release redis connection and pool, if any """
-        if self.redis is not None:
-            self.redis.close()
+        redis, redis_pool = self.redis, self.redis_pool
+        # Cleared first so a second stop() or an un-wedging listener cannot reuse them
+        self.redis, self.redis_pool = None, None
         #
-        if self.redis_pool is not None:
-            self.redis_pool.close()
+        if redis is not None:
+            redis.close()
+        #
+        if redis_pool is not None:
+            redis_pool.close()
 
     def emit_data(self, data):
         """ Emit event data """
@@ -179,6 +183,4 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
             #
             return Redis(connection_pool=redis_pool), redis_pool
         #
-        result = self._connect_with_retry("connect", connect, deadline)
-        #
-        return result if result is not None else (None, None)
+        return self._connect_with_retry("connect", connect, deadline)

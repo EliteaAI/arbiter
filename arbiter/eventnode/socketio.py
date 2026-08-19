@@ -93,8 +93,12 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
 
     def _close_transport(self):
         """ Release socketio connection, if any """
-        if self.sio is not None:
-            self.sio.disconnect()
+        sio = self.sio
+        # Cleared first so a second stop() or an un-wedging listener cannot reuse it
+        self.sio = None
+        #
+        if sio is not None:
+            sio.disconnect()
 
     def emit_data(self, data):
         """ Emit event data """

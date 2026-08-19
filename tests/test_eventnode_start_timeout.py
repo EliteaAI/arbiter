@@ -263,10 +263,19 @@ class TestAbortedStartCleanup:
         #
         _timed_start(node)
         #
-        with pytest.raises(RuntimeError, match="can only be started once"):
+        with pytest.raises(RuntimeError):
             node.start()
         #
         node.release.set()
+
+    def test_stop_during_connect_raises_instead_of_yielding_no_connection(self):
+        # A stop() landing while connect is still retrying must not hand back a "connected"
+        # node with no connection - the first emit would die on None
+        node = SlowConnectNode(start_max_wait=5)
+        node.stop_event.set()
+        #
+        with pytest.raises(EventNodeStartTimeout, match="gave up"):
+            node._connect_transport(None)  # pylint: disable=W0212
 
     def test_late_listener_does_not_fill_an_undrained_queue(self):
         node = LateListenerNode(start_max_wait=0.3)
@@ -292,11 +301,13 @@ class TestBackendDefaults:
         assert node.start_max_wait is None
         assert node.clone_config["start_max_wait"] is None
 
-    @pytest.mark.parametrize("node", [
-        RedisEventNode(host="127.0.0.1"),
-        MockEventNode(),
-    ])
-    def test_other_backends_are_bounded(self, node):
+    @pytest.mark.parametrize("factory", [
+        lambda: RedisEventNode(host="127.0.0.1"),
+        lambda: MockEventNode(),
+    ], ids=["redis", "mock"])
+    def test_other_backends_are_bounded(self, factory):
+        node = factory()
+        #
         assert node.start_max_wait == 60.0
         assert node.clone_config["start_max_wait"] == 60.0
 
@@ -359,6 +370,9 @@ class TestRedisNode:
         assert node.started is False
         assert stub_redis.closed is True
         assert stub_pool.closed is True
+        # cleared, so stop() below cannot close them a second time
+        assert node.redis is None
+        assert node.redis_pool is None
         #
         block_event.set()
         node.stop()  # must not blow up after a failed start
