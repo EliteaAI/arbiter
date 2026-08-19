@@ -41,8 +41,12 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
             use_ssl=False, ssl_verify=False,
             log_errors=True,
             retry_interval=3.0,
+            start_max_wait=60.0,
     ):  # pylint: disable=R0913,R0914
-        super().__init__(hmac_key, hmac_digest, callback_workers, log_errors)
+        super().__init__(
+            hmac_key, hmac_digest, callback_workers, log_errors,
+            start_max_wait=start_max_wait,
+        )
         #
         self.clone_config = {
             "type": "EventNode",
@@ -62,6 +66,7 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
             "ssl_verify": ssl_verify,
             "log_errors": log_errors,
             "retry_interval": retry_interval,
+            "start_max_wait": start_max_wait,
         }
         #
         self.queue_config = Config(host, port, user, password, vhost, event_queue, all_queue=None)
@@ -123,6 +128,8 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
                 #
                 channel.start_consuming()
             except:  # pylint: disable=W0702
+                self.record_worker_error()
+                #
                 if self.log_errors:
                     log.exception(
                         "Exception in listening thread. Retrying in %s seconds", self.retry_interval
@@ -161,6 +168,8 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
                 connection.process_data_events()
                 return connection
             except:  # pylint: disable=W0702
+                self.record_worker_error()
+                #
                 if self.log_errors and \
                         self.failed_connections >= self.mute_first_failed_connections:
                     log.exception(

@@ -30,8 +30,12 @@ class MockEventNode(EventNodeBase):  # pylint: disable=R0902
             hmac_key=None, hmac_digest="sha512",
             callback_workers=1,
             log_errors=True,
+            start_max_wait=60.0,
     ):  # pylint: disable=R0913
-        super().__init__(hmac_key, hmac_digest, callback_workers, log_errors)
+        super().__init__(
+            hmac_key, hmac_digest, callback_workers, log_errors,
+            start_max_wait=start_max_wait,
+        )
         #
         self.clone_config = {
             "type": "MockEventNode",
@@ -39,6 +43,7 @@ class MockEventNode(EventNodeBase):  # pylint: disable=R0902
             "hmac_digest": hmac_digest,
             "callback_workers": callback_workers,
             "log_errors": log_errors,
+            "start_max_wait": start_max_wait,
         }
 
     def emit_data(self, data):

@@ -19,6 +19,7 @@
     Event node
 """
 
+import sys
 import hmac
 import gzip
 import queue
@@ -31,6 +32,10 @@ from .tools import make_event_node
 from . import hooks
 
 
+class EventNodeStartTimeout(Exception):
+    """ Raised when event node workers do not become ready in time """
+
+
 class EventNodeBase:  # pylint: disable=R0902
     """ Event node (base) - allows to subscribe to events and to emit new events """
 
@@ -41,6 +46,7 @@ class EventNodeBase:  # pylint: disable=R0902
             log_errors=True,
             use_emit_queue=False,
             emitting_workers=1,
+            start_max_wait=60.0,
     ):  # pylint: disable=R0913
         self.clone_config = None
         #
@@ -60,6 +66,11 @@ class EventNodeBase:  # pylint: disable=R0902
         self.event_lock = threading.Lock()
         #
         self.queue_get_timeout = 1
+        #
+        # None means "wait forever" - transports that connect to a peer that may
+        # legitimately not be up yet (ZeroMQ mesh) rely on that
+        self.start_max_wait = start_max_wait
+        self.worker_error = None
         #
         self.sync_queue = queue.SimpleQueue()
         self.use_emit_queue = use_emit_queue
@@ -121,10 +132,30 @@ class EventNodeBase:  # pylint: disable=R0902
             for callback_thread in self.callback_threads:
                 callback_thread.start()
         #
-        self.emitting_ready_event.wait()
-        self.listening_ready_event.wait()
+        self._wait_until_ready("emitting", self.emitting_ready_event)
+        self._wait_until_ready("listening", self.listening_ready_event)
         #
         self.started = True
+
+    def _wait_until_ready(self, worker_kind, ready_event):
+        """ Wait for worker readiness, raise instead of blocking forever """
+        if ready_event.wait(self.start_max_wait):
+            return
+        #
+        # Give up on this start: let already-spawned daemon workers leave their loops
+        self.stop_event.set()
+        #
+        cause = repr(self.worker_error) if self.worker_error is not None \
+            else "no error recorded, worker still blocked"
+        #
+        raise EventNodeStartTimeout(
+            f"{type(self).__name__}: {worker_kind} worker not ready "
+            f"in {self.start_max_wait}s, cause: {cause}"
+        )
+
+    def record_worker_error(self):
+        """ Remember current exception so a start() timeout can name the cause """
+        self.worker_error = sys.exc_info()[1]
 
     def stop(self):
         """ Stop event node """

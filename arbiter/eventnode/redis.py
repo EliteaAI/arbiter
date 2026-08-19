@@ -39,8 +39,12 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
             retry_interval=3.0,
             use_managed_identity=False,
             username=None,
+            start_max_wait=60.0,
     ):  # pylint: disable=R0913,R0914
-        super().__init__(hmac_key, hmac_digest, callback_workers, log_errors)
+        super().__init__(
+            hmac_key, hmac_digest, callback_workers, log_errors,
+            start_max_wait=start_max_wait,
+        )
         #
         self.clone_config = {
             "type": "RedisEventNode",
@@ -58,6 +62,7 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
             "retry_interval": retry_interval,
             "use_managed_identity": use_managed_identity,
             "username": username,
+            "start_max_wait": start_max_wait,
         }
         #
         self.retry_interval = retry_interval
@@ -115,17 +120,25 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
         #
         self.redis, self.redis_pool = self._get_connection_and_pool()
         #
-        super().start(emit_only)
+        try:
+            super().start(emit_only)
+        except:  # pylint: disable=W0702
+            self._close_connection()
+            raise
 
     def stop(self):
         """ Stop event node """
         super().stop()
         #
-        if self.started:
+        self._close_connection()
+
+    def _close_connection(self):
+        """ Release redis connection and pool, if any """
+        if self.redis is not None:
             self.redis.close()
-            #
-            if self.redis_pool is not None:
-                self.redis_pool.close()
+        #
+        if self.redis_pool is not None:
+            self.redis_pool.close()
 
     def emit_data(self, data):
         """ Emit event data """
@@ -146,6 +159,8 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
                     #
                     self.sync_queue.put(message.get("data", b""))
             except:  # pylint: disable=W0702
+                self.record_worker_error()
+                #
                 if self.running and self.log_errors:
                     log.exception(
                         "Exception in listening thread. Retrying in %s seconds", self.retry_interval
@@ -175,6 +190,8 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
                 #
                 return redis, redis_pool
             except:  # pylint: disable=W0702
+                self.record_worker_error()
+                #
                 if self.log_errors and \
                         self.failed_connections >= self.mute_first_failed_connections:
                     log.exception(

@@ -27,6 +27,7 @@ from arbiter.eventnode import RedisEventNode
 from arbiter.eventnode import SocketIOEventNode
 from arbiter.eventnode import ZeroMQEventNode
 from arbiter.eventnode import MockEventNode
+from arbiter.eventnode import EventNodeStartTimeout
 
 from arbiter.servernode import ZeroMQServerNode
 

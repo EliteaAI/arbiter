@@ -40,10 +40,12 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
             ssl_verify=False, socketio_path="socket.io",
             log_errors=True,
             retry_interval=3.0,
+            start_max_wait=60.0,
     ):  # pylint: disable=R0913
         super().__init__(
             hmac_key, hmac_digest, callback_workers, log_errors,
             use_emit_queue=True, emitting_workers=1,
+            start_max_wait=start_max_wait,
         )
         #
         self.clone_config = {
@@ -60,6 +62,7 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
             "socketio_path": socketio_path,
             "log_errors": log_errors,
             "retry_interval": retry_interval,
+            "start_max_wait": start_max_wait,
         }
         #
         self.sio_config = {
@@ -85,13 +88,21 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
         #
         self.sio = self._get_connection()
         #
-        super().start(emit_only)
+        try:
+            super().start(emit_only)
+        except:  # pylint: disable=W0702
+            self._close_connection()
+            raise
 
     def stop(self):
         """ Stop event node """
         super().stop()
         #
-        if self.started:
+        self._close_connection()
+
+    def _close_connection(self):
+        """ Release socketio connection, if any """
+        if self.sio is not None:
             self.sio.disconnect()
 
     def emit_data(self, data):
@@ -103,6 +114,8 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
 
     def emitting_worker(self):
         """ Emitting thread: emit event data from emit_queue """
+        self.emitting_ready_event.set()
+        #
         while self.running:
             try:
                 data = self.emit_queue.get(timeout=self.queue_get_timeout)
@@ -111,6 +124,8 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
             except queue.Empty:
                 pass
             except:  # pylint: disable=W0702
+                self.record_worker_error()
+                #
                 if self.log_errors:
                     log.exception("Error during event emitting, skipping")
         #
@@ -124,6 +139,8 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
                 self.listening_ready_event.set()
                 self.sio.wait()
             except:  # pylint: disable=W0702
+                self.record_worker_error()
+                #
                 if self.log_errors:
                     log.exception(
                         "Exception in listening thread. Retrying in %s seconds", self.retry_interval
@@ -160,6 +177,8 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
                 #
                 return sio
             except:  # pylint: disable=W0702
+                self.record_worker_error()
+                #
                 if self.log_errors and \
                         self.failed_connections >= self.mute_first_failed_connections:
                     log.exception(

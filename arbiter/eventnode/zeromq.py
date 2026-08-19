@@ -63,10 +63,12 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
             sockopt_heartbeat_timeout=None,
             #
             connection_wait_interval=5.0,
+            start_max_wait=None,
     ):  # pylint: disable=R0913,R0914
         super().__init__(
             hmac_key, hmac_digest, callback_workers, log_errors,
             use_emit_queue=True,
+            start_max_wait=start_max_wait,
         )
         #
         self.clone_config = {
@@ -96,6 +98,7 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
             "sockopt_heartbeat_ttl": sockopt_heartbeat_ttl,
             "sockopt_heartbeat_timeout": sockopt_heartbeat_timeout,
             "connection_wait_interval": connection_wait_interval,
+            "start_max_wait": start_max_wait,
         }
         #
         self.retry_interval = retry_interval

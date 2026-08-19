@@ -39,6 +39,11 @@ def make_event_node(config=None, env_prefix="EVENTNODE_"):
             "ssl_verify",
         ]
         #
+        float_vars = [
+            "retry_interval",
+            "start_max_wait",
+        ]
+        #
         for key, value in os.environ.items():
             if key.startswith(env_prefix):
                 config_key = key[len(env_prefix):].lower()
@@ -49,6 +54,9 @@ def make_event_node(config=None, env_prefix="EVENTNODE_"):
                 #
                 if config_key in bool_vars:
                     config_value = value.lower() in ["true", "yes"]
+                #
+                if config_key in float_vars:
+                    config_value = None if value.lower() == "none" else float(value)
                 #
                 config[config_key] = config_value
     #
