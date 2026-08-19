@@ -81,26 +81,17 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
         #
         self.sio = None
 
-    def start(self, emit_only=False):
-        """ Start event node """
-        if self.started:
-            return
-        #
-        self.sio = self._get_connection()
-        #
-        try:
-            super().start(emit_only)
-        except:  # pylint: disable=W0702
-            self._close_connection()
-            raise
-
     def stop(self):
         """ Stop event node """
         super().stop()
         #
-        self._close_connection()
+        self._close_transport()
 
-    def _close_connection(self):
+    def _connect_transport(self, deadline):
+        """ Create socketio connection """
+        self.sio = self._get_connection(deadline)
+
+    def _close_transport(self):
         """ Release socketio connection, if any """
         if self.sio is not None:
             self.sio.disconnect()
@@ -124,7 +115,7 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
             except queue.Empty:
                 pass
             except:  # pylint: disable=W0702
-                self.record_worker_error()
+                self.record_worker_error("emitting")
                 #
                 if self.log_errors:
                     log.exception("Error during event emitting, skipping")
@@ -139,7 +130,7 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
                 self.listening_ready_event.set()
                 self.sio.wait()
             except:  # pylint: disable=W0702
-                self.record_worker_error()
+                self.record_worker_error("listening")
                 #
                 if self.log_errors:
                     log.exception(
@@ -156,36 +147,24 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
         if self.data_base64:
             body = base64.b64decode(body)
         #
-        self.sync_queue.put(body)
+        self._put_sync_data(body)
 
-    def _get_connection(self):
-        while self.running:
-            try:
-                sio = socketio.Client(
-                    ssl_verify=self.sio_config["ssl_verify"],
-                )
-                #
-                sio.connect(
-                    url=self.sio_config["url"],
-                    socketio_path=self.sio_config["socketio_path"],
-                )
-                #
-                sio.emit("eventnode_join", {
-                    "password": self.sio_config["password"],
-                    "room": self.sio_config["room"],
-                })
-                #
-                return sio
-            except:  # pylint: disable=W0702
-                self.record_worker_error()
-                #
-                if self.log_errors and \
-                        self.failed_connections >= self.mute_first_failed_connections:
-                    log.exception(
-                        "Failed to create connection. Retrying in %s seconds", self.retry_interval
-                    )
-                #
-                self.failed_connections += 1
-                time.sleep(self.retry_interval)
+    def _get_connection(self, deadline=None):
+        def connect():
+            sio = socketio.Client(
+                ssl_verify=self.sio_config["ssl_verify"],
+            )
+            #
+            sio.connect(
+                url=self.sio_config["url"],
+                socketio_path=self.sio_config["socketio_path"],
+            )
+            #
+            sio.emit("eventnode_join", {
+                "password": self.sio_config["password"],
+                "room": self.sio_config["room"],
+            })
+            #
+            return sio
         #
-        return None
+        return self._connect_with_retry("connect", connect, deadline)

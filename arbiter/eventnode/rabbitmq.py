@@ -128,7 +128,7 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
                 #
                 channel.start_consuming()
             except:  # pylint: disable=W0702
-                self.record_worker_error()
+                self.record_worker_error("listening")
                 #
                 if self.log_errors:
                     log.exception(
@@ -143,43 +143,31 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
 
     def _listening_callback(self, channel, method, properties, body):
         _ = channel, method, properties
-        self.sync_queue.put(body)
+        self._put_sync_data(body)
 
-    def _get_connection(self):
-        while self.running:
-            try:
-                #
-                pika_ssl_options = None
-                if self.ssl_context is not None:
-                    pika_ssl_options = pika.SSLOptions(self.ssl_context, self.ssl_server_hostname)
-                #
-                connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(
-                        host=self.queue_config.host,
-                        port=self.queue_config.port,
-                        virtual_host=self.queue_config.vhost,
-                        credentials=pika.PlainCredentials(
-                            self.queue_config.user,
-                            self.queue_config.password
-                        ),
-                        ssl_options=pika_ssl_options,
-                    )
+    def _get_connection(self, deadline=None):
+        def connect():
+            pika_ssl_options = None
+            if self.ssl_context is not None:
+                pika_ssl_options = pika.SSLOptions(self.ssl_context, self.ssl_server_hostname)
+            #
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(
+                    host=self.queue_config.host,
+                    port=self.queue_config.port,
+                    virtual_host=self.queue_config.vhost,
+                    credentials=pika.PlainCredentials(
+                        self.queue_config.user,
+                        self.queue_config.password
+                    ),
+                    ssl_options=pika_ssl_options,
                 )
-                connection.process_data_events()
-                return connection
-            except:  # pylint: disable=W0702
-                self.record_worker_error()
-                #
-                if self.log_errors and \
-                        self.failed_connections >= self.mute_first_failed_connections:
-                    log.exception(
-                        "Failed to create connection. Retrying in %s seconds", self.retry_interval
-                    )
-                #
-                self.failed_connections += 1
-                time.sleep(self.retry_interval)
+            )
+            connection.process_data_events()
+            #
+            return connection
         #
-        return None
+        return self._connect_with_retry("connect", connect, deadline)
 
     def _get_channel(self, connection):
         channel = connection.channel()

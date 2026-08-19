@@ -113,26 +113,17 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
         self.redis = None
         self.redis_pool = None
 
-    def start(self, emit_only=False):
-        """ Start event node """
-        if self.started:
-            return
-        #
-        self.redis, self.redis_pool = self._get_connection_and_pool()
-        #
-        try:
-            super().start(emit_only)
-        except:  # pylint: disable=W0702
-            self._close_connection()
-            raise
-
     def stop(self):
         """ Stop event node """
         super().stop()
         #
-        self._close_connection()
+        self._close_transport()
 
-    def _close_connection(self):
+    def _connect_transport(self, deadline):
+        """ Create redis connection and pool """
+        self.redis, self.redis_pool = self._get_connection_and_pool(deadline)
+
+    def _close_transport(self):
         """ Release redis connection and pool, if any """
         if self.redis is not None:
             self.redis.close()
@@ -157,9 +148,9 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
                     if not message:
                         continue
                     #
-                    self.sync_queue.put(message.get("data", b""))
+                    self._put_sync_data(message.get("data", b""))
             except:  # pylint: disable=W0702
-                self.record_worker_error()
+                self.record_worker_error("listening")
                 #
                 if self.running and self.log_errors:
                     log.exception(
@@ -179,26 +170,15 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
                 except:  # pylint: disable=W0702
                     pass
 
-    def _get_connection_and_pool(self):
-        while self.running:
-            try:
-                from redis.connection import BlockingConnectionPool  # pylint: disable=C0415,E0401
-                from redis import Redis  # pylint: disable=C0415,E0401
-                #
-                redis_pool = BlockingConnectionPool(**self.redis_config)
-                redis = Redis(connection_pool=redis_pool)
-                #
-                return redis, redis_pool
-            except:  # pylint: disable=W0702
-                self.record_worker_error()
-                #
-                if self.log_errors and \
-                        self.failed_connections >= self.mute_first_failed_connections:
-                    log.exception(
-                        "Failed to create connection. Retrying in %s seconds", self.retry_interval
-                    )
-                #
-                self.failed_connections += 1
-                time.sleep(self.retry_interval)
+    def _get_connection_and_pool(self, deadline=None):
+        def connect():
+            from redis.connection import BlockingConnectionPool  # pylint: disable=C0415,E0401
+            from redis import Redis  # pylint: disable=C0415,E0401
+            #
+            redis_pool = BlockingConnectionPool(**self.redis_config)
+            #
+            return Redis(connection_pool=redis_pool), redis_pool
         #
-        return None, None
+        result = self._connect_with_retry("connect", connect, deadline)
+        #
+        return result if result is not None else (None, None)

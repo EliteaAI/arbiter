@@ -137,10 +137,9 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
         self.pending_emit_count = 0
         self.pending_emit_lock = threading.Lock()
 
-    def start(self, emit_only=False):
-        """ Start event node """
-        if self.started:
-            return
+    def _connect_transport(self, deadline):
+        """ Create ZeroMQ context """
+        _ = deadline
         #
         if self.zmq_gevent:
             import zmq.green as zmq  # pylint: disable=C0415,E0401
@@ -148,8 +147,6 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
             import zmq  # pylint: disable=C0415,E0401
         #
         self.zmq_ctx = zmq.Context()
-        #
-        super().start(emit_only)
 
     def stop(self):
         """ Stop event node """
@@ -351,7 +348,7 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
                 if not message:
                     continue
                 #
-                self.sync_queue.put(message)
+                self._put_sync_data(message)
             except:  # pylint: disable=W0702
                 if self.running:
                     if self.log_errors:

@@ -53,8 +53,67 @@ class FailingListenerNode(EventNodeBase):
             try:
                 raise RuntimeError("subscribe blew up")
             except:  # pylint: disable=W0702
-                self.record_worker_error()
+                self.record_worker_error("listening")
                 time.sleep(0.05)
+
+
+class SlowConnectNode(EventNodeBase):
+    """ Node whose transport connect never succeeds.
+
+    Stands in for SocketIOEventNode, which connects on the CALLING thread before any
+    worker starts - a retry loop the worker-readiness bound cannot see.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.retry_interval = 0.05
+        self.attempts = 0
+
+    def _connect_transport(self, deadline):
+        def connect():
+            self.attempts += 1
+            raise ConnectionRefusedError("broker down")
+        #
+        self._connect_with_retry("connect", connect, deadline)
+
+    def listening_worker(self):
+        self.listening_ready_event.set()
+
+
+class FlakyConnectWedgedListenerNode(WedgedListenerNode):
+    """ Transport connect fails once then succeeds, and the listener then wedges """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.retry_interval = 0.01
+        self.attempts = 0
+
+    def _connect_transport(self, deadline):
+        def connect():
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("stale pool hiccup")
+            #
+            return object()
+        #
+        self._connect_with_retry("connect", connect, deadline)
+
+
+class LateListenerNode(EventNodeBase):
+    """ Listener that only reaches sync_queue after start() already gave up """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.release = threading.Event()
+        self.closed = False
+
+    def _close_transport(self):
+        self.closed = True
+
+    def listening_worker(self):
+        self.release.wait()
+        self.listening_ready_event.set()
+        self._put_sync_data(b"late message")
 
 
 class WedgedEmitterNode(EventNodeBase):
@@ -151,6 +210,76 @@ class TestStartTimeout:
         node.stop()
 
 
+class TestAbortedStartCleanup:
+    def test_transport_connect_loop_is_bounded_too(self):
+        # Regression: only worker readiness was bounded, a connect retry loop on the
+        # calling thread (SocketIO) still hung the caller forever
+        node = SlowConnectNode(start_max_wait=0.4)
+        #
+        elapsed, message = _timed_start(node)
+        #
+        assert elapsed < 5
+        assert "connect did not succeed" in message
+        assert "ConnectionRefusedError: broker down" in message
+        assert node.attempts > 1  # it did retry, it did not fail on the first attempt
+
+    def test_recorded_cause_is_not_the_exception_object(self):
+        # Holding the exception would pin its traceback -> frame locals -> event payload
+        node = FailingListenerNode(start_max_wait=0.3)
+        #
+        _timed_start(node)
+        #
+        assert isinstance(node.worker_errors["listening"], str)
+
+    def test_connect_error_is_not_blamed_on_the_listener(self):
+        # A transient connect error must not be reported as the listener's cause
+        node = FlakyConnectWedgedListenerNode(start_max_wait=0.3)
+        #
+        _, message = _timed_start(node)
+        #
+        assert node.attempts == 2  # connect recovered, so its error is stale
+        #
+        assert "listening worker not ready" in message
+        assert "none from listening" in message  # named as someone else's error
+        assert "stale pool hiccup" in message  # still surfaced, just not misattributed
+        #
+        node.release.set()
+
+    def test_aborted_start_stops_emitting_and_closes_transport(self):
+        node = LateListenerNode(start_max_wait=0.3)
+        #
+        _timed_start(node)
+        #
+        assert node.can_emit is False  # emit_queue has no consumer left
+        assert node.closed is True
+        #
+        node.emit("some_event", {"payload": "dropped"})
+        assert node.sync_queue.empty() is True
+
+    def test_timed_out_node_must_be_discarded(self):
+        # Documented contract on EventNodeStartTimeout: worker threads are spent, so a
+        # retry on the same object cannot work. Pinned here so it stays explicit.
+        node = WedgedListenerNode(start_max_wait=0.3)
+        #
+        _timed_start(node)
+        #
+        with pytest.raises(RuntimeError, match="can only be started once"):
+            node.start()
+        #
+        node.release.set()
+
+    def test_late_listener_does_not_fill_an_undrained_queue(self):
+        node = LateListenerNode(start_max_wait=0.3)
+        #
+        _timed_start(node)
+        #
+        # listener un-wedges only now, after start() gave up and callback workers exited
+        node.release.set()
+        time.sleep(0.2)
+        #
+        assert node.sync_queue.empty() is True
+
+
 class TestBackendDefaults:
     def test_zeromq_stays_unbounded(self):
         # The mesh connects to another pylon that may not be up yet
@@ -221,7 +350,8 @@ class TestRedisNode:
         stub_redis, stub_pool = StubRedis(block_event), StubPool()
         #
         node = RedisEventNode(host="127.0.0.1", start_max_wait=0.5)
-        node._get_connection_and_pool = lambda: (stub_redis, stub_pool)  # pylint: disable=W0212
+        node._get_connection_and_pool = \
+            lambda deadline=None: (stub_redis, stub_pool)  # pylint: disable=W0212
         #
         with pytest.raises(EventNodeStartTimeout):
             node.start()
