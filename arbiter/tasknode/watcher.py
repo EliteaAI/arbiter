@@ -285,16 +285,31 @@ class TaskNodeWatcher(threading.Thread):  # pylint: disable=R0903
             self._announce_task_stopped(task_id, task_data["result"])
 
     def _announce_task_stopped(self, task_id, result):
-        task_state = self.node.global_task_state[task_id].copy()
-        #
-        task_state["status"] = "stopped"
-        task_state["result"] = result
-        #
+        # Release the slot before anything that can raise: the caller swallows
+        # exceptions, so a failure above this point would leak the task forever
         with self.node.lock:
-            self.node.local_tasks.pop(task_id, None)
+            local_task = self.node.local_tasks.pop(task_id, None)
             self.node.running_tasks.pop(task_id, None)
             if not self.node.running_tasks:
                 self.node.have_running_tasks.clear()
+            #
+            known_state = self.node.global_task_state.get(task_id, None)
+        #
+        if known_state is not None:
+            task_state = known_state.copy()
+        else:
+            # Housekeeping may have dropped the row while the task was finishing
+            log.warning("No known state for stopped task %s, announcing minimal", task_id)
+            #
+            task_state = {
+                "task_id": task_id,
+                "requestor": None,
+                "runner": self.node.ident,
+                "meta": local_task.get("meta", None) if local_task else None,
+            }
+        #
+        task_state["status"] = "stopped"
+        task_state["result"] = result
         #
         self.node.event_node.emit(
             "task_node_announce",

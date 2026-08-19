@@ -61,6 +61,8 @@ class TaskNode:  # pylint: disable=R0902,R0904
             tmp_path="/tmp/tasknode", result_transport="memory",
             start_attempts=3, thread_scan_interval=1,
             task_approver=None,
+            state_reply_authority=False, orphan_grace_period=300,
+            orphan_batch_limit=300,
     ):
         self.event_node = event_node
         self.event_node_was_started = False
@@ -92,6 +94,11 @@ class TaskNode:  # pylint: disable=R0902,R0904
         self.result_transport = result_transport
         #
         self.housekeeping_interval = housekeeping_interval
+        # One switch on purpose: merging alone leaks unclaimed rows forever, and
+        # retirement alone still lets a narrow reply erase a running task
+        self.state_reply_authority = state_reply_authority
+        self.orphan_grace_period = orphan_grace_period
+        self.orphan_batch_limit = orphan_batch_limit
         self.start_max_wait = start_max_wait
         self.query_wait = query_wait
         self.watcher_max_wait = watcher_max_wait
@@ -612,10 +619,13 @@ class TaskNode:  # pylint: disable=R0902,R0904
         if event_payload.get("task_id", None) is not None:
             task_id = event_payload.get("task_id")
             #
-            if task_id not in self.global_task_state:
+            # Single read: housekeeping can retire the row between a check and a get
+            known_state = self.global_task_state.get(task_id, None)
+            #
+            if known_state is None:
                 return
             #
-            task_state = self.global_task_state[task_id].copy()
+            task_state = known_state.copy()
             task_state["for_requestor"] = event_payload.get("requestor", None)
             #
             self.announce_task_state(task_state)
@@ -643,7 +653,9 @@ class TaskNode:  # pylint: disable=R0902,R0904
             for task_id in list(self.global_task_state):
                 if task_id in self.running_tasks:
                     global_task_state.pop(task_id, None)
-                else:
+                elif not self.state_reply_authority:
+                    # One reply is treated as the whole truth, so a task missing from it
+                    # is dropped even while it runs: retirement needs reverify instead
                     self.global_task_state.pop(task_id, None)
             #
             self.global_task_state.update(global_task_state)
