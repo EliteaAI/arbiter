@@ -73,6 +73,22 @@ def make_node(**kwargs):
     return node
 
 
+def _payloads_in(value):
+    """ Every dict reachable one or two levels down, for retention checks """
+    found = []
+    #
+    if isinstance(value, dict):
+        found.append(value)
+        #
+        for item in value.values():
+            found.extend(_payloads_in(item))
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            found.extend(_payloads_in(item))
+    #
+    return found
+
+
 def add_gossip_row(node, task_id, status="running", runner="peer_runner"):
     """ A row this node only learned about from the bus: nothing local backs it """
     node.global_task_state[task_id] = {
@@ -208,6 +224,56 @@ class TestOrphanReverify:
         #
         assert "becomes_ours" in node.global_task_state
         assert "becomes_ours" in node.running_tasks
+
+    @staticmethod
+    def test_newer_state_wins_over_the_collected_snapshot():
+        # An authoritative announce can land after suspects were picked. The row we
+        # would retire is no longer the row we judged, so the newer state must win
+        node = make_node(state_reply_authority=True)
+        add_gossip_row(node, "changed", status="pending", runner=None)
+        #
+        def restate(event_name, payload):
+            if event_name != "task_state_query":
+                return
+            #
+            node.global_task_state["changed"]["status"] = "running"
+        #
+        node.event_node.on_emit = restate
+        TaskNodeHousekeeper(node).reverify_orphans()
+        #
+        assert "changed" in node.global_task_state
+        assert node.global_task_state["changed"]["status"] == "running"
+
+    @staticmethod
+    def test_late_callback_state_is_not_retained_across_passes():
+        # process_data copies the callback list and invokes it later, so unsubscribe
+        # is not a barrier. A reply still in flight when the pass closes must be
+        # dropped, not parked in state that a pass finding no suspects never clears
+        node = make_node(state_reply_authority=True)
+        housekeeper = TaskNodeHousekeeper(node)
+        #
+        add_gossip_row(node, "first")
+        housekeeper.reverify_orphans()
+        #
+        late_reply = {
+            "task_id": "first",
+            "for_requestor": node.ident,
+            "runner": "peer_runner",
+            "announcer": "peer_runner",
+            "status": "running",
+        }
+        housekeeper.on_reverify_reply("task_state_announce", late_reply)
+        #
+        # Nothing is a suspect now, so a pass that bails early must still leave no
+        # task-state payload reachable from the housekeeper
+        housekeeper.reverify_orphans()
+        #
+        retained = [
+            value for name, value in vars(housekeeper).items()
+            if name != "node" and late_reply in _payloads_in(value)
+        ]
+        #
+        assert not retained
 
     @staticmethod
     def test_pass_is_bounded_by_batch_limit():
