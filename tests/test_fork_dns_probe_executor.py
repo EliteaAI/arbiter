@@ -81,6 +81,7 @@ node = TaskNode(
     types.SimpleNamespace(can_emit=True, event_callbacks={}, catch_all_callbacks=[]),
     fork_dns_probe_enabled=os.environ["PROBE_ENABLED"] == "1",
     fork_dns_probe_timeout=0.3,
+    fork_dns_probe_resolver_timeout=0.3,
 )
 
 node.executor(

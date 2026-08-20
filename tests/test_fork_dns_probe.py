@@ -19,12 +19,15 @@
 import logging
 import socket
 import threading
+import time
 
 import pytest  # pylint: disable=E0401,W0611
 
 from arbiter.tasknode.tasknode import TaskNode
 from arbiter.tasknode.tools import (
+    FORK_DNS_PROBE_ENV_PREFIX,
     FORK_DNS_PROBE_TARGETS,
+    FORK_DNS_RESOLVER_PROBE_TARGET,
     ForkDnsUnusableError,
     InterruptTaskThread,
     TaskStartupError,
@@ -65,29 +68,72 @@ class TestGuardExceptionHierarchy:
 
 class TestProbeTargets:
     @staticmethod
-    def test_three_distinct_nss_paths_are_probed():
-        # Probing a single shape lets roughly 15% of poisoned children through, because
-        # a resolvable name, an NXDOMAIN name and a bare IP take different NSS paths.
-        assert len(FORK_DNS_PROBE_TARGETS) == 3
+    def test_decisive_targets_need_no_network():
+        # These two are what the fast verdict is allowed to rest on, precisely because
+        # neither needs to reach a resolver: a hang here can only be the inherited lock.
         hosts = [host for host, _ in FORK_DNS_PROBE_TARGETS]
-        assert "localhost" in hosts
-        assert "127.0.0.1" in hosts
+        assert hosts == ["localhost", "127.0.0.1"]
+        assert FORK_DNS_RESOLVER_PROBE_TARGET[0] not in hosts
+
+    @staticmethod
+    def test_the_network_target_is_separate_from_the_decisive_ones():
+        # Kept as its own constant so a slow resolver cannot produce a fast abort. Probing
+        # only the local shapes would let a resolver-only lock through (~15% measured),
+        # so it must still be probed - just on a budget long enough to outlast slowness.
+        assert ".invalid" in FORK_DNS_RESOLVER_PROBE_TARGET[0]
 
     @staticmethod
     def test_nxdomain_target_is_fully_qualified():
         # Without the trailing dot the resolver retries the name against every
         # resolv.conf search domain. On a 9-domain search list that walk measured 8.7s
         # against a 2s probe timeout, which aborts perfectly healthy children.
-        nxdomain = [host for host in (h for h, _ in FORK_DNS_PROBE_TARGETS) if ".invalid" in host]
-        assert len(nxdomain) == 1
-        assert nxdomain[0].endswith("."), "the NXDOMAIN probe target must be fully qualified"
+        assert FORK_DNS_RESOLVER_PROBE_TARGET[0].endswith("."), \
+            "the NXDOMAIN probe target must be fully qualified"
 
 
 class TestProbeDnsUsable:
     @staticmethod
-    def test_healthy_resolver_is_reported_usable():
-        # Generous timeout on purpose: this asserts "the probe completes", not "how fast".
+    def test_healthy_resolver_is_reported_usable(monkeypatch):
+        # Faked rather than real: a CI runner without egress DNS sits right on glibc's
+        # default timeout:5 attempts:2, which would make this flaky. Real-network
+        # behaviour is exercised by the subprocess tests instead.
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [("fake",)])
         assert probe_dns_usable(10.0) is True
+
+    @staticmethod
+    def test_a_slow_resolver_is_not_treated_as_a_wedge(monkeypatch):
+        # The regression this pins: the verdict used to be "did all lookups finish inside
+        # the timeout", so any slow target aborted a healthy child. One dropped UDP packet
+        # to cluster DNS costs >=5s under glibc defaults, and the abort is default-on
+        # across every fork pool - so the misfire was fleet-wide, on tasks needing no DNS.
+        real_getaddrinfo = socket.getaddrinfo
+
+        def slow_network_target(host, *args, **kwargs):
+            if host == FORK_DNS_RESOLVER_PROBE_TARGET[0]:
+                time.sleep(0.5)
+                raise socket.gaierror("slow")
+            return real_getaddrinfo(host, *args, **kwargs)
+
+        monkeypatch.setattr(socket, "getaddrinfo", slow_network_target)
+        assert probe_dns_usable(0.1, 5.0) is True
+
+    @staticmethod
+    def test_a_locked_resolver_is_still_caught_when_the_local_paths_work(monkeypatch):
+        # The other half of the same trade: only the network target hangs, so the fast
+        # verdict cannot see it. It must still abort, just on the longer budget.
+        release = threading.Event()
+        real_getaddrinfo = socket.getaddrinfo
+
+        def wedged_network_target(host, *args, **kwargs):
+            if host == FORK_DNS_RESOLVER_PROBE_TARGET[0]:
+                release.wait()
+            return real_getaddrinfo(host, *args, **kwargs)
+
+        monkeypatch.setattr(socket, "getaddrinfo", wedged_network_target)
+        try:
+            assert probe_dns_usable(0.1, 0.4) is False
+        finally:
+            release.set()
 
     @staticmethod
     def test_blocked_resolver_is_reported_unusable_within_the_timeout(monkeypatch):
@@ -101,7 +147,7 @@ class TestProbeDnsUsable:
 
         monkeypatch.setattr(socket, "getaddrinfo", blocked_getaddrinfo)
         try:
-            assert probe_dns_usable(0.3) is False
+            assert probe_dns_usable(0.3, 0.3) is False
         finally:
             # Let the daemon probe thread unwind instead of leaking it into later tests.
             release.set()
@@ -132,18 +178,62 @@ class TestResolutionFreeAbortPath:
             logging.root.handlers = original
 
 
+class TestAbortHelperIsForkOnly:
+    @staticmethod
+    def test_a_non_fork_context_raises_without_touching_process_state():
+        # The helper is the advertised extension point for future startup guards, and the
+        # obvious next call site is the threading executor - which runs in the pylon
+        # process. There the handler surgery would permanently strip the pylon's eventnode
+        # logging, and the events branch would os._exit the whole pylon. In-process the
+        # plain raise is already correct, so that is all it is allowed to do.
+        handler = _RecordingHandler()
+        logging.root.addHandler(handler)
+        error = ForkDnsUnusableError("nope")
+        try:
+            with pytest.raises(ForkDnsUnusableError) as raised:
+                TaskNode(None)._abort_task_startup(  # pylint: disable=W0212
+                    "task-1", "events", error, "threading",
+                )
+            assert raised.value is error
+            assert handler in logging.root.handlers
+        finally:
+            logging.root.removeHandler(handler)
+
+
 class TestTaskNodeOptions:
     @staticmethod
     def test_probe_options_default_to_on_with_a_two_second_timeout():
         node = TaskNode(None)
         assert node.fork_dns_probe_enabled is True
         assert node.fork_dns_probe_timeout == 2.0
+        assert node.fork_dns_probe_resolver_timeout == 15.0
 
     @staticmethod
     def test_probe_options_are_configurable():
-        node = TaskNode(None, fork_dns_probe_enabled=False, fork_dns_probe_timeout=0.5)
+        node = TaskNode(
+            None, fork_dns_probe_enabled=False, fork_dns_probe_timeout=0.5,
+            fork_dns_probe_resolver_timeout=3.0,
+        )
         assert node.fork_dns_probe_enabled is False
         assert node.fork_dns_probe_timeout == 0.5
+        assert node.fork_dns_probe_resolver_timeout == 3.0
+
+    @staticmethod
+    def test_env_overrides_win_over_the_constructor(monkeypatch):
+        # The ops surface. No plugin wires these to descriptor config, so without an env
+        # override the only remedy for a misfiring default-on guard is a plugin change
+        # plus an image roll - too slow for something that can abort a whole fork pool.
+        monkeypatch.setenv(f"{FORK_DNS_PROBE_ENV_PREFIX}ENABLED", "false")
+        monkeypatch.setenv(f"{FORK_DNS_PROBE_ENV_PREFIX}RESOLVER_TIMEOUT", "45")
+        node = TaskNode(None, fork_dns_probe_enabled=True)
+        assert node.fork_dns_probe_enabled is False
+        assert node.fork_dns_probe_resolver_timeout == 45.0
+
+    @staticmethod
+    def test_an_unparseable_env_override_falls_back_instead_of_raising(monkeypatch):
+        # A typo in an env var must not stop the pylon from starting.
+        monkeypatch.setenv(f"{FORK_DNS_PROBE_ENV_PREFIX}TIMEOUT", "two seconds")
+        assert TaskNode(None).fork_dns_probe_timeout == 2.0
 
     @staticmethod
     def test_unknown_option_is_ignored_with_a_warning(caplog):

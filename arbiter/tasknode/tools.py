@@ -61,15 +61,35 @@ class ForkDnsUnusableError(TaskStartupError):
     pass  # pylint: disable=W0107
 
 
-# Three shapes on purpose - each takes a different NSS path, and probing only one lets
-# ~15% of poisoned children through (measured). The NXDOMAIN name is fully qualified so
-# it is not retried against every resolv.conf search domain: that walk can outlast the
-# probe timeout and abort a healthy child (measured 8.7s vs 0.01s on 9 search domains).
+# Decisive: these need no network, so a hang here can only be the inherited lock.
 FORK_DNS_PROBE_TARGETS = (
     ("localhost", 80),
-    ("elitea-fork-probe.invalid.", 80),
     ("127.0.0.1", 0),
 )
+
+# Advisory: catches a resolver lock the local shapes miss, but a slow network is
+# indistinguishable from a wedge - so this one gets a long budget, not a fast verdict.
+# Fully qualified on purpose: without the dot it is retried against every resolv.conf
+# search domain (measured 8.7s vs 0.01s on 9 domains), which is itself a false abort.
+FORK_DNS_RESOLVER_PROBE_TARGET = ("elitea-fork-probe.invalid.", 80)
+
+FORK_DNS_PROBE_ENV_PREFIX = "ARBITER_FORK_DNS_PROBE_"
+
+
+def fork_dns_probe_env_override(name, value):
+    """ Env wins: a default-on guard must be tunable without a plugin change and image roll """
+    raw = os.environ.get(f"{FORK_DNS_PROBE_ENV_PREFIX}{name.upper()}")
+    #
+    if raw is None:
+        return value
+    #
+    if isinstance(value, bool):
+        return raw.strip().lower() in ("true", "1", "yes", "on")
+    #
+    try:
+        return float(raw)
+    except ValueError:
+        return value
 
 
 def stderr_note(message):
@@ -92,10 +112,11 @@ def detach_resolving_log_handlers():
         pass
 
 
-def probe_dns_usable(timeout=2.0):
+def probe_dns_usable(timeout=2.0, resolver_timeout=15.0):
     """ True if getaddrinfo still works in this process """
     # On a throwaway thread, not under SIGALRM: a Python signal handler never fires on a
     # C-level futex deadlock, but join() on a wedged thread does return.
+    local_done = []
     finished = []
     #
     def _probe():
@@ -105,10 +126,23 @@ def probe_dns_usable(timeout=2.0):
             except:  # pylint: disable=W0702
                 pass  # resolution failing is fine; hanging is not
         #
+        local_done.append(True)
+        #
+        try:
+            socket.getaddrinfo(*FORK_DNS_RESOLVER_PROBE_TARGET)
+        except:  # pylint: disable=W0702
+            pass
+        #
         finished.append(True)
     #
     thread = threading.Thread(target=_probe, name="fork_dns_probe", daemon=True)
     thread.start()
-    thread.join(timeout)
     #
+    thread.join(timeout)
+    if not local_done:
+        return False  # a lookup that needs no network hung: the lock is held
+    #
+    # Slow is not wedged, and only an endless wait is worth aborting a task over: a
+    # struggling resolver used to abort healthy children fleet-wide (#6288 review).
+    thread.join(resolver_timeout)
     return bool(finished)
