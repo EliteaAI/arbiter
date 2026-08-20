@@ -39,8 +39,12 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
             retry_interval=3.0,
             use_managed_identity=False,
             username=None,
+            start_max_wait=60.0,
     ):  # pylint: disable=R0913,R0914
-        super().__init__(hmac_key, hmac_digest, callback_workers, log_errors)
+        super().__init__(
+            hmac_key, hmac_digest, callback_workers, log_errors,
+            start_max_wait=start_max_wait,
+        )
         #
         self.clone_config = {
             "type": "RedisEventNode",
@@ -58,6 +62,7 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
             "retry_interval": retry_interval,
             "use_managed_identity": use_managed_identity,
             "username": username,
+            "start_max_wait": start_max_wait,
         }
         #
         self.retry_interval = retry_interval
@@ -108,24 +113,35 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
         self.redis = None
         self.redis_pool = None
 
-    def start(self, emit_only=False):
-        """ Start event node """
-        if self.started:
-            return
-        #
-        self.redis, self.redis_pool = self._get_connection_and_pool()
-        #
-        super().start(emit_only)
-
     def stop(self):
         """ Stop event node """
         super().stop()
         #
-        if self.started:
-            self.redis.close()
-            #
-            if self.redis_pool is not None:
-                self.redis_pool.close()
+        self._close_transport()
+
+    def _connect_transport(self, deadline):
+        """ Create redis connection and pool """
+        self.redis, self.redis_pool = self._get_connection_and_pool(deadline)
+
+    def _close_transport(self):
+        """ Release redis subscription, connection and pool, if any """
+        pubsub = self._take_listening_resource()
+        redis, redis_pool = self.redis, self.redis_pool
+        # Cleared first so a second stop() or an un-wedging listener cannot reuse them
+        self.redis, self.redis_pool = None, None
+        #
+        # Closing the active subscription is what wakes a listener blocked in listen()
+        if pubsub is not None:
+            try:
+                pubsub.close()
+            except:  # pylint: disable=W0702
+                pass
+        #
+        if redis is not None:
+            redis.close()
+        #
+        if redis_pool is not None:
+            redis_pool.close()
 
     def emit_data(self, data):
         """ Emit event data """
@@ -134,54 +150,55 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
     def listening_worker(self):
         """ Listening thread: push event data to sync_queue """
         while self.running:
+            pubsub = None
+            published = False
             try:
                 pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe(self.redis_event_queue)
                 #
+                # Handed over before checking shutdown: an aborted start either closes this exact
+                # subscription or refuses the handoff here, so neither side can miss it
+                published = self._publish_listening_resource(pubsub)
+                #
+                if not published:
+                    break
+                #
                 self.listening_ready_event.set()
                 #
                 for message in pubsub.listen():
+                    if not self.running:
+                        break
+                    #
                     if not message:
                         continue
                     #
-                    self.sync_queue.put(message.get("data", b""))
+                    self._put_sync_data(message.get("data", b""))
             except:  # pylint: disable=W0702
+                self.record_worker_error("listening")
+                #
                 if self.running and self.log_errors:
                     log.exception(
                         "Exception in listening thread. Retrying in %s seconds", self.retry_interval
                     )
                 #
-                try:
-                    pubsub.close()
-                except:  # pylint: disable=W0702
-                    pass
-                #
                 if self.running:
                     time.sleep(self.retry_interval)
             finally:
-                try:
-                    pubsub.close()  # TODO: handle redis errors
-                except:  # pylint: disable=W0702
-                    pass
+                # Exactly one side closes: whoever takes the handoff, or us if it never happened
+                if pubsub is not None and \
+                        (self._take_listening_resource() is not None or not published):
+                    try:
+                        pubsub.close()  # TODO: handle redis errors
+                    except:  # pylint: disable=W0702
+                        pass
 
-    def _get_connection_and_pool(self):
-        while self.running:
-            try:
-                from redis.connection import BlockingConnectionPool  # pylint: disable=C0415,E0401
-                from redis import Redis  # pylint: disable=C0415,E0401
-                #
-                redis_pool = BlockingConnectionPool(**self.redis_config)
-                redis = Redis(connection_pool=redis_pool)
-                #
-                return redis, redis_pool
-            except:  # pylint: disable=W0702
-                if self.log_errors and \
-                        self.failed_connections >= self.mute_first_failed_connections:
-                    log.exception(
-                        "Failed to create connection. Retrying in %s seconds", self.retry_interval
-                    )
-                #
-                self.failed_connections += 1
-                time.sleep(self.retry_interval)
+    def _get_connection_and_pool(self, deadline=None):
+        def connect():
+            from redis.connection import BlockingConnectionPool  # pylint: disable=C0415,E0401
+            from redis import Redis  # pylint: disable=C0415,E0401
+            #
+            redis_pool = BlockingConnectionPool(**self.redis_config)
+            #
+            return Redis(connection_pool=redis_pool), redis_pool
         #
-        return None, None
+        return self._connect_with_retry("connect", connect, deadline)

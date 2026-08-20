@@ -19,6 +19,8 @@
     Event node
 """
 
+import sys
+import time
 import hmac
 import gzip
 import queue
@@ -31,8 +33,25 @@ from .tools import make_event_node
 from . import hooks
 
 
+class EventNodeStartTimeout(Exception):
+    """ Raised when event node fails to become ready in time """
+    #
+    # Node must be discarded after this: its worker threads are spent and cannot be restarted
+
+
 class EventNodeBase:  # pylint: disable=R0902
     """ Event node (base) - allows to subscribe to events and to emit new events """
+
+    # Bound for cleanup after a failed start: it must not delay the failure indefinitely
+    cleanup_max_wait = 5.0
+
+    # Closing usually wakes a blocked worker; transports whose close is not thread-safe
+    # while workers run (ZeroMQ sockets) flip this and close after the join instead
+    close_transport_before_join = True
+
+    # Grace after the deadline, so code that checks the deadline itself reports its own
+    # cause instead of losing the race and being reported as a thread left behind
+    deadline_settle_wait = 0.5
 
     def __init__(
             self,
@@ -41,6 +60,7 @@ class EventNodeBase:  # pylint: disable=R0902
             log_errors=True,
             use_emit_queue=False,
             emitting_workers=1,
+            start_max_wait=60.0,
     ):  # pylint: disable=R0913
         self.clone_config = None
         #
@@ -59,7 +79,21 @@ class EventNodeBase:  # pylint: disable=R0902
         self.stop_event = threading.Event()
         self.event_lock = threading.Lock()
         #
+        # Guards the handoff of the live listening resource between worker and cleanup
+        self.transport_lock = threading.Lock()
+        self.listening_resource = None
+        #
         self.queue_get_timeout = 1
+        #
+        # None means "wait forever": ZeroMQ mesh peers may legitimately be down at boot,
+        # so there the only hang signal stays the "not connected yet" warning
+        self.start_max_wait = start_max_wait
+        self.worker_errors = {}
+        #
+        # Retry defaults for _connect_with_retry, overridden by transports that have them
+        self.retry_interval = 3.0
+        self.mute_first_failed_connections = 0
+        self.failed_connections = 0
         #
         self.sync_queue = queue.SimpleQueue()
         self.use_emit_queue = use_emit_queue
@@ -71,22 +105,33 @@ class EventNodeBase:  # pylint: disable=R0902
             self.emit_queue = queue.SimpleQueue()
             self.emitting_threads = []
             #
-            for _ in range(emitting_workers):
+            for index in range(emitting_workers):
                 self.emitting_threads.append(
-                    threading.Thread(target=self.emitting_worker, daemon=True)
+                    threading.Thread(
+                        target=self.emitting_worker, daemon=True,
+                        name=f"eventnode-emitting-{index}",
+                    )
                 )
         #
-        self.listening_thread = threading.Thread(target=self.listening_worker, daemon=True)
+        # Named so a stuck worker is identifiable in cleanup logs and faulthandler dumps
+        self.listening_thread = threading.Thread(
+            target=self.listening_worker, daemon=True, name="eventnode-listening",
+        )
         self.callback_threads = []
         #
         if callback_workers is None:
             self.callback_threads.append(
-                threading.Thread(target=self.callback_spawner, daemon=True)
+                threading.Thread(
+                    target=self.callback_spawner, daemon=True, name="eventnode-callback-spawner",
+                )
             )
         else:
-            for _ in range(callback_workers):
+            for index in range(callback_workers):
                 self.callback_threads.append(
-                    threading.Thread(target=self.callback_worker, daemon=True)
+                    threading.Thread(
+                        target=self.callback_worker, daemon=True,
+                        name=f"eventnode-callback-{index}",
+                    )
                 )
         #
         self.emitting_ready_event = threading.Event()
@@ -107,6 +152,76 @@ class EventNodeBase:  # pylint: disable=R0902
         if self.started:
             return
         #
+        self.worker_errors.clear()
+        #
+        # One deadline for the whole start(): connecting and worker readiness share it
+        deadline = None if self.start_max_wait is None \
+            else time.monotonic() + self.start_max_wait
+        #
+        try:
+            self._connect_transport_bounded(deadline)
+            #
+            # A transport that connected after the deadline is not a healthy start either
+            if self._deadline_expired(deadline):
+                raise EventNodeStartTimeout(
+                    f"{type(self).__name__}: transport connected only after the "
+                    f"{self.start_max_wait}s deadline"
+                )
+            #
+            self._start_workers(emit_only, deadline)
+        except:  # pylint: disable=W0702
+            self._abort_start()
+            raise
+        #
+        self.started = True
+
+    def _connect_transport_bounded(self, deadline):
+        """ Connect the transport, releasing a connection that arrives after the deadline """
+        def connect():
+            self._connect_transport(deadline)
+            #
+            # Too late to be used: release it here, nothing else will
+            if not self.running:
+                self._close_transport()
+        #
+        self._run_bounded("connect", connect, deadline)
+
+    def _run_bounded(self, stage, target, deadline, args=(), settle=True):  # pylint: disable=R0913
+        """ Run a blocking transport call without letting it outlast the deadline """
+        timeout = self._time_left(deadline)
+        #
+        if timeout is None:
+            target(*args)
+            return
+        #
+        error = []
+        #
+        def runner():
+            try:
+                target(*args)
+            except BaseException as exc:  # pylint: disable=W0703
+                error.append(exc)
+        #
+        thread = threading.Thread(target=runner, daemon=True, name=f"eventnode-{stage}")
+        thread.start()
+        thread.join(timeout)
+        #
+        # No settle grace when the deadline is a shared budget: it would overspend it
+        if thread.is_alive() and settle:
+            thread.join(self.deadline_settle_wait)
+        #
+        if thread.is_alive():
+            # Left behind on purpose: a thread inside a native call (getaddrinfo) is unwakeable
+            raise EventNodeStartTimeout(
+                f"{type(self).__name__}: {stage} did not return in {timeout}s, "
+                f"thread left behind, cause: {self._describe_error(stage)}"
+            )
+        #
+        if error:
+            raise error[0]
+
+    def _start_workers(self, emit_only, deadline):
+        """ Spawn worker threads and wait until they report readiness """
         if self.use_emit_queue:
             for emitting_thread in self.emitting_threads:
                 emitting_thread.start()
@@ -121,10 +236,197 @@ class EventNodeBase:  # pylint: disable=R0902
             for callback_thread in self.callback_threads:
                 callback_thread.start()
         #
-        self.emitting_ready_event.wait()
-        self.listening_ready_event.wait()
+        self._wait_until_ready("emitting", self.emitting_ready_event, deadline)
+        self._wait_until_ready("listening", self.listening_ready_event, deadline)
+
+    def _abort_start(self):
+        """ Give up on this start: stop workers, stop emitting, drop the transport """
+        # can_emit guards the unbounded emit_queue, which now has no consumer
+        self.can_emit = False
+        self.stop_event.set()
         #
-        self.started = True
+        # One budget for the whole cleanup: closing and joining share it, not one each
+        deadline = time.monotonic() + self.cleanup_max_wait
+        #
+        if self.close_transport_before_join:
+            self._close_transport_bounded(deadline)
+            self._join_workers(deadline)
+        else:
+            self._join_workers(deadline)
+            self._close_transport_bounded(deadline)
+        #
+        self._detach_application_state()
+
+    def _close_transport_bounded(self, deadline):
+        """ Release the transport without letting a stuck close hold up the failure """
+        try:
+            self._run_bounded("close", self._close_transport, deadline, settle=False)
+        except:  # pylint: disable=W0702
+            if self.log_errors:
+                log.exception("Failed to close transport on aborted start")
+
+    def _join_workers(self, deadline):
+        """ Bounded join of worker threads, naming the ones that could not be stopped """
+        threads = list(self.emitting_threads or []) + \
+            [self.listening_thread] + list(self.callback_threads)
+        #
+        stuck = []
+        #
+        for thread in threads:
+            if not thread.is_alive():
+                continue
+            #
+            thread.join(self._time_left(deadline))
+            #
+            if thread.is_alive():
+                stuck.append(thread.name)
+        #
+        if stuck and self.log_errors:
+            log.warning(
+                "Event node workers did not stop within the %ss cleanup budget: %s",
+                self.cleanup_max_wait, ", ".join(stuck),
+            )
+        #
+        return stuck
+
+    def _detach_application_state(self):
+        """ Drop callbacks, hooks and queued payloads a stuck worker would otherwise pin """
+        with self.event_lock:
+            self.event_callbacks.clear()
+            self.catch_all_callbacks.clear()
+            self.before_callback_hooks.clear()
+            self.after_callback_hooks.clear()
+        #
+        self._discard_queued_data()
+
+    def _discard_queued_data(self):
+        """ Drop queued payloads: after a failed start nothing will consume them """
+        for data_queue in (self.sync_queue, self.emit_queue):
+            if data_queue is None:
+                continue
+            #
+            while True:
+                try:
+                    data_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+    def _publish_listening_resource(self, resource):
+        """ Offer the live listening resource to cleanup, refused if the node is already stopping """
+        with self.transport_lock:
+            if not self.running:
+                return False
+            #
+            self.listening_resource = resource
+            return True
+
+    def _take_listening_resource(self):
+        """ Take the published resource, so exactly one side ever releases it """
+        with self.transport_lock:
+            resource = self.listening_resource
+            self.listening_resource = None
+            #
+            return resource
+
+    def _connect_transport(self, deadline):
+        """ Connect transport before workers start, for backends that need it """
+        _ = deadline
+
+    def _close_transport(self):
+        """ Release transport resources, if any """
+
+    def _connect_with_retry(self, source, connect, deadline):
+        """ Retry connect() until it succeeds, the node stops or the deadline expires """
+        while self.running:
+            try:
+                return connect()
+            except:  # pylint: disable=W0702
+                self.record_worker_error(source)
+                #
+                if self.log_errors and \
+                        self.failed_connections >= self.mute_first_failed_connections:
+                    log.exception(
+                        "Failed to create connection. Retrying in %s seconds", self.retry_interval
+                    )
+                #
+                self.failed_connections += 1
+                #
+                if self._deadline_expired(deadline):
+                    raise EventNodeStartTimeout(
+                        f"{type(self).__name__}: {source} did not succeed "
+                        f"in {self.start_max_wait}s, cause: {self._describe_error(source)}"
+                    )
+                #
+                self.stop_event.wait(self._retry_sleep(deadline))
+        #
+        # Never return a missing connection: callers would treat None as usable
+        raise EventNodeStartTimeout(
+            f"{type(self).__name__}: {source} gave up, node stopped before it succeeded"
+        )
+
+    def _wait_until_ready(self, worker_kind, ready_event, deadline):
+        """ Wait for worker readiness, raise instead of blocking forever """
+        if not ready_event.wait(self._time_left(deadline)):
+            raise EventNodeStartTimeout(
+                f"{type(self).__name__}: {worker_kind} worker not ready "
+                f"in {self.start_max_wait}s, cause: {self._describe_error(worker_kind)}"
+            )
+        #
+        # The deadline is the contract, not the readiness flag: late readiness is still a failure
+        if self._deadline_expired(deadline):
+            raise EventNodeStartTimeout(
+                f"{type(self).__name__}: {worker_kind} worker became ready only after "
+                f"the {self.start_max_wait}s deadline"
+            )
+
+    def _retry_sleep(self, deadline):
+        """ Retry pause, never overshooting the start deadline """
+        if deadline is None:
+            return self.retry_interval
+        #
+        return min(self.retry_interval, self._time_left(deadline))
+
+    @staticmethod
+    def _deadline_expired(deadline):
+        """ Check whether the start deadline is reached """
+        return deadline is not None and time.monotonic() >= deadline
+
+    @staticmethod
+    def _time_left(deadline):
+        """ Seconds left until deadline, None meaning "wait forever" """
+        if deadline is None:
+            return None
+        #
+        return max(0.0, deadline - time.monotonic())
+
+    def record_worker_error(self, source):
+        """ Remember formatted error so a start() timeout can name the cause """
+        exc = sys.exc_info()[1]
+        #
+        # Formatted, not the exception itself: its traceback pins frame locals (event payloads)
+        self.worker_errors[source] = f"{type(exc).__name__}: {exc}"
+
+    def _describe_error(self, source):
+        """ Describe the error recorded for source, without attributing another one to it """
+        # Snapshot: retrying workers keep recording while this formats
+        errors = dict(self.worker_errors)
+        #
+        if source in errors:
+            return errors[source]
+        #
+        if errors:
+            others = ", ".join(f"{key}: {value}" for key, value in errors.items())
+            return f"none from {source}, other errors: {others}"
+        #
+        return "no error recorded, worker still blocked"
+
+    def _put_sync_data(self, data):
+        """ Hand received data to callback workers, unless the node is stopping """
+        # A listener that un-wedges after a failed start must not fill an undrained queue
+        if not self.running:
+            return
+        #
+        self.sync_queue.put(data)
 
     def stop(self):
         """ Stop event node """

@@ -19,6 +19,8 @@
 
 from .tools import make_event_node
 
+from .base import EventNodeStartTimeout
+
 from .rabbitmq import EventNode
 from .redis import RedisEventNode
 from .socketio import SocketIOEventNode

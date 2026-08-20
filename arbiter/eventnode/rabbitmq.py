@@ -41,8 +41,12 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
             use_ssl=False, ssl_verify=False,
             log_errors=True,
             retry_interval=3.0,
+            start_max_wait=60.0,
     ):  # pylint: disable=R0913,R0914
-        super().__init__(hmac_key, hmac_digest, callback_workers, log_errors)
+        super().__init__(
+            hmac_key, hmac_digest, callback_workers, log_errors,
+            start_max_wait=start_max_wait,
+        )
         #
         self.clone_config = {
             "type": "EventNode",
@@ -62,6 +66,7 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
             "ssl_verify": ssl_verify,
             "log_errors": log_errors,
             "retry_interval": retry_interval,
+            "start_max_wait": start_max_wait,
         }
         #
         self.queue_config = Config(host, port, user, password, vhost, event_queue, all_queue=None)
@@ -85,6 +90,28 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
         self.mute_first_failed_connections = mute_first_failed_connections
         self.failed_connections = 0
 
+    def stop(self):
+        """ Stop event node """
+        super().stop()
+        #
+        self._close_transport()
+
+    def _close_transport(self):
+        """ Ask the listening consumer to stop, if any """
+        # Taken, not read: a second stop() cannot post the callback twice
+        consumer = self._take_listening_resource()
+        #
+        if consumer is None:
+            return
+        #
+        connection, channel = consumer
+        #
+        # pika is not thread-safe: stop_consuming has to run on the connection's own thread
+        try:
+            connection.add_callback_threadsafe(channel.stop_consuming)
+        except:  # pylint: disable=W0702
+            pass
+
     def emit_data(self, data):
         """ Emit event data """
         connection = self._get_connection()
@@ -104,6 +131,7 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
     def listening_worker(self):
         """ Listening thread: push event data to sync_queue """
         while self.running:
+            connection = None
             try:
                 connection = self._get_connection()
                 channel = self._get_channel(connection)
@@ -119,16 +147,27 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
                     auto_ack=True
                 )
                 #
+                # Handed over before checking shutdown: an aborted start either stops this exact
+                # consumer or refuses the handoff here, so neither side can miss it
+                if not self._publish_listening_resource((connection, channel)):
+                    break
+                #
                 self.listening_ready_event.set()
                 #
                 channel.start_consuming()
             except:  # pylint: disable=W0702
-                if self.log_errors:
+                self.record_worker_error("listening")
+                #
+                if self.running and self.log_errors:
                     log.exception(
                         "Exception in listening thread. Retrying in %s seconds", self.retry_interval
                     )
-                time.sleep(self.retry_interval)
+                #
+                if self.running:
+                    time.sleep(self.retry_interval)
             finally:
+                self._take_listening_resource()
+                #
                 try:
                     connection.close()
                 except:  # pylint: disable=W0702
@@ -136,41 +175,31 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
 
     def _listening_callback(self, channel, method, properties, body):
         _ = channel, method, properties
-        self.sync_queue.put(body)
+        self._put_sync_data(body)
 
-    def _get_connection(self):
-        while self.running:
-            try:
-                #
-                pika_ssl_options = None
-                if self.ssl_context is not None:
-                    pika_ssl_options = pika.SSLOptions(self.ssl_context, self.ssl_server_hostname)
-                #
-                connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(
-                        host=self.queue_config.host,
-                        port=self.queue_config.port,
-                        virtual_host=self.queue_config.vhost,
-                        credentials=pika.PlainCredentials(
-                            self.queue_config.user,
-                            self.queue_config.password
-                        ),
-                        ssl_options=pika_ssl_options,
-                    )
+    def _get_connection(self, deadline=None):
+        def connect():
+            pika_ssl_options = None
+            if self.ssl_context is not None:
+                pika_ssl_options = pika.SSLOptions(self.ssl_context, self.ssl_server_hostname)
+            #
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(
+                    host=self.queue_config.host,
+                    port=self.queue_config.port,
+                    virtual_host=self.queue_config.vhost,
+                    credentials=pika.PlainCredentials(
+                        self.queue_config.user,
+                        self.queue_config.password
+                    ),
+                    ssl_options=pika_ssl_options,
                 )
-                connection.process_data_events()
-                return connection
-            except:  # pylint: disable=W0702
-                if self.log_errors and \
-                        self.failed_connections >= self.mute_first_failed_connections:
-                    log.exception(
-                        "Failed to create connection. Retrying in %s seconds", self.retry_interval
-                    )
-                #
-                self.failed_connections += 1
-                time.sleep(self.retry_interval)
+            )
+            connection.process_data_events()
+            #
+            return connection
         #
-        return None
+        return self._connect_with_retry("connect", connect, deadline)
 
     def _get_channel(self, connection):
         channel = connection.channel()
