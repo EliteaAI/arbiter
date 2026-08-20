@@ -62,14 +62,14 @@ class ForkDnsUnusableError(TaskStartupError):
     pass  # pylint: disable=W0107
 
 
-# These need no network, so a hang here can only be the inherited lock.
+# Redundant while the resolver leg runs (that one walks the same nsswitch/hosts/resolv.conf
+# path first); this is the guard that remains when calibration drops the resolver leg.
 FORK_DNS_PROBE_TARGETS = (
     ("localhost", 80),
-    ("127.0.0.1", 0),
 )
 
-# The only target guaranteed to reach the resolver: /etc/hosts can silently shortcut a real
-# name, and the local shapes above provably send zero packets.
+# The only leg reaching the resolver and dlopening the NSS module: a real name can be
+# shortcut by /etc/hosts, and the local leg sends no packet and loads no module.
 # Fully qualified on purpose: without the dot it is retried against every resolv.conf
 # search domain (measured 8.7s vs 0.01s on 9 domains), which is itself a false abort.
 FORK_DNS_RESOLVER_PROBE_TARGET = ("elitea-fork-probe.invalid.", 80)

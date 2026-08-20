@@ -69,18 +69,26 @@ class TestGuardExceptionHierarchy:
 
 class TestProbeTargets:
     @staticmethod
-    def test_decisive_targets_need_no_network():
-        # These two are what the fast verdict is allowed to rest on, precisely because
-        # neither needs to reach a resolver: a hang here can only be the inherited lock.
+    def test_the_local_leg_needs_no_network():
+        # localhost still opens nsswitch.conf, resolv.conf, /etc/hosts and the nscd socket
+        # (measured), so a hang here is an inherited lock - it just sends no packet.
         hosts = [host for host, _ in FORK_DNS_PROBE_TARGETS]
-        assert hosts == ["localhost", "127.0.0.1"]
+        assert hosts == ["localhost"]
         assert FORK_DNS_RESOLVER_PROBE_TARGET[0] not in hosts
 
     @staticmethod
-    def test_the_network_target_is_separate_from_the_decisive_ones():
-        # Kept as its own constant so a slow resolver cannot produce a fast abort. Probing
-        # only the local shapes would let a resolver-only lock through (~15% measured),
-        # so it must still be probed - just on a budget long enough to outlast slowness.
+    def test_no_numeric_target_is_probed():
+        # A numeric literal short-circuits inside getaddrinfo before any NSS machinery:
+        # measured 0 file opens, 0 sockets, 0 dlopens. It can only ever prove nothing.
+        assert not [
+            host for host, _ in FORK_DNS_PROBE_TARGETS
+            if host.replace(".", "").isdigit() or ":" in host
+        ]
+
+    @staticmethod
+    def test_the_resolver_leg_is_separate_from_the_local_one():
+        # Kept as its own constant so calibration can drop it independently. It is also the
+        # only leg that dlopens an NSS module, i.e. the only one exercising _dl_load_lock.
         assert ".invalid" in FORK_DNS_RESOLVER_PROBE_TARGET[0]
 
     @staticmethod
