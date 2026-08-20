@@ -166,6 +166,49 @@ class BlockingCloseNode(WedgedListenerNode):
         self.close_release.wait()
 
 
+class BlockedCloseAndWorkerNode(BlockingCloseNode):
+    """ Both cleanup steps block: close never returns and the listener never releases.
+
+    Used to check the advertised bound, so the cleanup budget is the dominant term here
+    and the settle allowance is deliberately small.
+    """
+
+    cleanup_max_wait = 1.0
+    deadline_settle_wait = 0.1
+
+
+class LateReadyEvent:
+    """ Readiness stand-in that reports success, but only after the deadline lapsed """
+
+    def __init__(self, delay):
+        self.delay = delay
+
+    def wait(self, timeout=None):
+        _ = timeout
+        time.sleep(self.delay)
+        #
+        return True
+
+    def set(self):
+        pass
+
+    def is_set(self):
+        return True
+
+
+class LateReadyNode(EventNodeBase):
+    """ Node whose listener reports readiness only after the start deadline has passed """
+
+    cleanup_max_wait = 0.3
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.listening_ready_event = LateReadyEvent(0.3)
+
+    def listening_worker(self):
+        self.listening_ready_event.set()
+
+
 class LateListenerNode(EventNodeBase):
     """ Listener that only reaches sync_queue after start() already gave up """
 
@@ -277,6 +320,33 @@ class TestStartTimeout:
         assert node.entered.is_set() is False
         #
         node.stop()
+
+
+class TestLateReadiness:
+    """ Readiness that arrives after the deadline is a failed start, not a healthy one """
+
+    def test_readiness_after_the_deadline_is_rejected(self):
+        node = LateReadyNode(start_max_wait=0.1)
+        #
+        _, message = _timed_start(node)
+        #
+        assert "became ready only after" in message
+        assert node.started is False
+        assert node.can_emit is False
+
+    def test_already_set_event_is_still_checked_against_the_deadline(self):
+        # Event.wait() returns true immediately for an event that is already set, so the
+        # deadline has to be re-checked afterwards - the same rule the connect path follows
+        node = MockEventNode(start_max_wait=0.1)
+        ready_event = threading.Event()
+        ready_event.set()
+        #
+        with pytest.raises(EventNodeStartTimeout) as excinfo:
+            node._wait_until_ready(  # pylint: disable=W0212
+                "listening", ready_event, time.monotonic() - 0.01,
+            )
+        #
+        assert "became ready only after" in str(excinfo.value)
 
 
 class TestAbortedStartCleanup:
@@ -400,6 +470,25 @@ class TestBlockingOperationsAreBounded:
         node.close_release.set()
         node.release.set()
 
+    def test_cleanup_spends_one_budget_and_respects_the_stated_bound(self):
+        # Both cleanup steps block, which is what makes the budgeting visible: close and the
+        # worker join have to share cleanup_max_wait, not take one each
+        node = BlockedCloseAndWorkerNode(start_max_wait=0.4)
+        #
+        elapsed, message = _timed_start(node)
+        #
+        assert node.close_entered.is_set() is True
+        assert node.listening_thread.is_alive() is True  # neither step could complete
+        assert "listening worker not ready" in message
+        #
+        bound = node.start_max_wait + node.deadline_settle_wait + node.cleanup_max_wait
+        #
+        assert elapsed >= node.start_max_wait
+        assert elapsed <= bound + 0.3  # slack for scheduling, not for a second budget
+        #
+        node.close_release.set()
+        node.release.set()
+
     def test_unbounded_start_still_connects_on_the_calling_thread(self):
         # start_max_wait=None keeps the legacy path: no helper thread, no changed
         # thread affinity for transports that care (ZeroMQ contexts, pika connections)
@@ -474,7 +563,9 @@ class TestWorkerCleanup:
         #
         node.release.set()
 
-    def test_repeated_failed_starts_do_not_accumulate_threads(self):
+    def test_repeated_releasable_failed_starts_do_not_accumulate_threads(self):
+        # Scoped to releasable failures on purpose: this emitter polls running and leaves,
+        # so cleanup really does reap it. See the irrecoverable case below for the limit.
         baseline = threading.active_count()
         #
         for _ in range(3):
@@ -485,6 +576,46 @@ class TestWorkerCleanup:
         gc.collect()
         #
         assert threading.active_count() <= baseline + 1
+
+    def test_repeated_irrecoverable_starts_keep_application_state_collectible(self):
+        # An unkillable native call leaves one abandoned daemon thread per failed node - the
+        # documented limit of this mitigation. What must not grow is application state, so
+        # the sentinels have to be collectible however many times the start fails.
+        class Sentinel:  # pylint: disable=R0903
+            def __init__(self):
+                self.payload = bytearray(1024 * 1024)
+
+            def on_event(self, event_name, payload):
+                _ = event_name, payload
+        #
+        baseline = threading.active_count()
+        attempts = 3
+        refs, nodes = [], []
+        #
+        for _ in range(attempts):
+            node = BlockingConnectNode(start_max_wait=0.2)
+            sentinel = Sentinel()
+            #
+            refs.append(weakref.ref(sentinel))
+            node.subscribe(..., sentinel.on_event)
+            node.sync_queue.put(b"payload nobody will consume")
+            #
+            _timed_start(node)
+            #
+            del sentinel
+            nodes.append(node)  # kept on purpose: a wedged node cannot be collected
+        #
+        gc.collect()
+        #
+        assert [ref() for ref in refs] == [None] * attempts
+        assert all(node.sync_queue.empty() for node in nodes)
+        assert all(not node.catch_all_callbacks for node in nodes)
+        #
+        # One abandoned helper thread per wedged call, and nothing beyond that
+        assert threading.active_count() <= baseline + attempts
+        #
+        for node in nodes:
+            node.release.set()
 
 
 BOUNDED_BACKENDS = [
@@ -554,6 +685,7 @@ class StubPubSub:
         self.listen_block = listen_block
         self.listen_entered = threading.Event()
         self.closed = False
+        self.close_calls = 0
 
     def subscribe(self, *args, **kwargs):
         _ = args, kwargs
@@ -570,6 +702,24 @@ class StubPubSub:
 
     def close(self):
         self.closed = True
+        self.close_calls += 1
+        #
+        # Closing is what releases a blocked listen(), as with a real subscription
+        if self.listen_block is not None:
+            self.listen_block.set()
+
+
+def _pause_handoff(node, at_handoff, resume):
+    """ Park the listening worker in the window between its blocking call and the handoff """
+    publish = node._publish_listening_resource  # pylint: disable=W0212
+    #
+    def paused_publish(resource):
+        at_handoff.set()
+        resume.wait(5)
+        #
+        return publish(resource)
+    #
+    node._publish_listening_resource = paused_publish  # pylint: disable=W0212
 
 
 class StubRedis:
@@ -644,6 +794,166 @@ class TestRedisNode:
         assert node.listening_thread.is_alive() is False
         assert stub_pubsub.listen_entered.is_set() is False
         assert stub_pubsub.closed is True
+
+    def test_abort_during_the_handoff_window_keeps_the_listener_out_of_listen(self):
+        # The interleaving that made publish-after-check racy: the worker sits between a
+        # returned subscribe() and handing the subscription over while abort runs to the end.
+        # Either abort closes it or the worker is refused - it must never reach listen().
+        subscribe_returns = threading.Event()
+        subscribe_returns.set()
+        #
+        stub_pubsub = StubPubSub(subscribe_returns, listen_block=threading.Event())
+        stub_redis, stub_pool = StubRedis(subscribe_returns, pubsub=stub_pubsub), StubPool()
+        #
+        node = RedisEventNode(host="127.0.0.1", start_max_wait=0.4)
+        node.cleanup_max_wait = 0.3
+        node._get_connection_and_pool = \
+            lambda deadline=None: (stub_redis, stub_pool)  # pylint: disable=W0212
+        #
+        at_handoff, resume = threading.Event(), threading.Event()
+        _pause_handoff(node, at_handoff, resume)
+        #
+        with pytest.raises(EventNodeStartTimeout):
+            node.start()
+        #
+        assert at_handoff.is_set() is True  # the worker is parked inside the window
+        #
+        resume.set()
+        node.listening_thread.join(timeout=5)
+        #
+        assert node.listening_thread.is_alive() is False
+        assert stub_pubsub.listen_entered.is_set() is False
+        assert stub_pubsub.close_calls == 1  # closed once, by the side that kept it
+
+    def test_stop_closes_the_published_subscription_exactly_once(self):
+        # The accepted half of the handoff: the subscription is live, so cleanup is the side
+        # that closes it and the worker must not close it a second time on its way out
+        subscribe_returns = threading.Event()
+        subscribe_returns.set()
+        #
+        stub_pubsub = StubPubSub(subscribe_returns, listen_block=threading.Event())
+        stub_redis, stub_pool = StubRedis(subscribe_returns, pubsub=stub_pubsub), StubPool()
+        #
+        node = RedisEventNode(host="127.0.0.1", start_max_wait=5.0)
+        node._get_connection_and_pool = \
+            lambda deadline=None: (stub_redis, stub_pool)  # pylint: disable=W0212
+        #
+        node.start()
+        #
+        assert node.started is True
+        assert stub_pubsub.listen_entered.wait(5) is True
+        #
+        node.stop()
+        node.stop()  # must not close the subscription again
+        #
+        node.listening_thread.join(timeout=5)
+        #
+        assert node.listening_thread.is_alive() is False
+        assert stub_pubsub.close_calls == 1
+
+
+class StubPikaChannel:
+    def __init__(self, consume_block):
+        self.consume_block = consume_block
+        self.consume_entered = threading.Event()
+        self.stop_calls = 0
+
+    class _DeclareResult:  # pylint: disable=R0903
+        class method:  # pylint: disable=C0103,R0903
+            queue = "stub-queue"
+
+    def queue_declare(self, *args, **kwargs):
+        _ = args, kwargs
+        #
+        return self._DeclareResult()
+
+    def queue_bind(self, *args, **kwargs):
+        _ = args, kwargs
+
+    def basic_consume(self, *args, **kwargs):
+        _ = args, kwargs
+
+    def start_consuming(self):
+        self.consume_entered.set()
+        self.consume_block.wait()
+
+    def stop_consuming(self):
+        self.stop_calls += 1
+        self.consume_block.set()
+
+
+class StubPikaConnection:
+    def __init__(self, channel):
+        self.stub_channel = channel
+        self.callbacks = []
+        self.close_calls = 0
+
+    def add_callback_threadsafe(self, callback):
+        self.callbacks.append(callback)
+
+    def close(self):
+        self.close_calls += 1
+
+
+def _stubbed_rabbitmq_node(connection, channel, **kwargs):
+    node = RabbitMQEventNode(host="127.0.0.1", port=5672, user="u", password="p", **kwargs)
+    #
+    node._get_connection = lambda deadline=None: connection  # pylint: disable=W0212
+    node._get_channel = lambda conn: channel  # pylint: disable=W0212
+    #
+    return node
+
+
+class TestRabbitMQNode:
+    def test_abort_during_the_handoff_window_keeps_the_consumer_out_of_consuming(self):
+        # Same race as the Redis one: cleanup must not miss a consumer that is about to
+        # start, and start_consuming() blocks with no running check inside it
+        channel = StubPikaChannel(threading.Event())
+        connection = StubPikaConnection(channel)
+        #
+        node = _stubbed_rabbitmq_node(connection, channel, start_max_wait=0.4)
+        node.cleanup_max_wait = 0.3
+        #
+        at_handoff, resume = threading.Event(), threading.Event()
+        _pause_handoff(node, at_handoff, resume)
+        #
+        with pytest.raises(EventNodeStartTimeout):
+            node.start()
+        #
+        assert at_handoff.is_set() is True
+        #
+        resume.set()
+        node.listening_thread.join(timeout=5)
+        #
+        assert node.listening_thread.is_alive() is False
+        assert channel.consume_entered.is_set() is False
+        assert channel.stop_calls == 0  # nothing to stop: consuming never began
+        assert connection.close_calls == 1  # released once, by the worker that owns it
+
+    def test_stop_posts_exactly_one_consumer_stop_callback(self):
+        # pika is not thread-safe, so stopping goes through the connection's own thread:
+        # the callback has to be posted once, whatever the caller does
+        channel = StubPikaChannel(threading.Event())
+        connection = StubPikaConnection(channel)
+        #
+        node = _stubbed_rabbitmq_node(connection, channel, start_max_wait=5.0)
+        #
+        node.start()
+        #
+        assert node.started is True
+        assert channel.consume_entered.wait(5) is True
+        #
+        node.stop()
+        node.stop()
+        #
+        assert len(connection.callbacks) == 1
+        #
+        connection.callbacks[0]()  # pika would run this on the consumer's own thread
+        node.listening_thread.join(timeout=5)
+        #
+        assert node.listening_thread.is_alive() is False
+        assert channel.stop_calls == 1
+        assert connection.close_calls == 1
 
 
 class TestSocketIONode:

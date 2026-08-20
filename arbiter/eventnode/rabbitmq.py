@@ -89,9 +89,6 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
         #
         self.mute_first_failed_connections = mute_first_failed_connections
         self.failed_connections = 0
-        #
-        self.listening_connection = None
-        self.listening_channel = None
 
     def stop(self):
         """ Stop event node """
@@ -101,12 +98,13 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
 
     def _close_transport(self):
         """ Ask the listening consumer to stop, if any """
-        connection, channel = self.listening_connection, self.listening_channel
-        # Cleared first so a second stop() cannot post a callback twice
-        self.listening_connection, self.listening_channel = None, None
+        # Taken, not read: a second stop() cannot post the callback twice
+        consumer = self._take_listening_resource()
         #
-        if connection is None or channel is None:
+        if consumer is None:
             return
+        #
+        connection, channel = consumer
         #
         # pika is not thread-safe: stop_consuming has to run on the connection's own thread
         try:
@@ -149,12 +147,11 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
                     auto_ack=True
                 )
                 #
-                # Connecting can block for a long time: the node may be gone by now
-                if not self.running:
+                # Handed over before checking shutdown: an aborted start either stops this exact
+                # consumer or refuses the handoff here, so neither side can miss it
+                if not self._publish_listening_resource((connection, channel)):
                     break
                 #
-                # Published so an aborted start can stop this exact consumer
-                self.listening_connection, self.listening_channel = connection, channel
                 self.listening_ready_event.set()
                 #
                 channel.start_consuming()
@@ -169,7 +166,7 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
                 if self.running:
                     time.sleep(self.retry_interval)
             finally:
-                self.listening_connection, self.listening_channel = None, None
+                self._take_listening_resource()
                 #
                 try:
                     connection.close()

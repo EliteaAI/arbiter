@@ -112,7 +112,6 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
         #
         self.redis = None
         self.redis_pool = None
-        self.redis_pubsub = None
 
     def stop(self):
         """ Stop event node """
@@ -126,9 +125,10 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
 
     def _close_transport(self):
         """ Release redis subscription, connection and pool, if any """
-        pubsub, redis, redis_pool = self.redis_pubsub, self.redis, self.redis_pool
+        pubsub = self._take_listening_resource()
+        redis, redis_pool = self.redis, self.redis_pool
         # Cleared first so a second stop() or an un-wedging listener cannot reuse them
-        self.redis_pubsub, self.redis, self.redis_pool = None, None, None
+        self.redis, self.redis_pool = None, None
         #
         # Closing the active subscription is what wakes a listener blocked in listen()
         if pubsub is not None:
@@ -151,16 +151,18 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
         """ Listening thread: push event data to sync_queue """
         while self.running:
             pubsub = None
+            published = False
             try:
                 pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe(self.redis_event_queue)
                 #
-                # subscribe() can block for a long time: the node may be gone by now
-                if not self.running:
+                # Handed over before checking shutdown: an aborted start either closes this exact
+                # subscription or refuses the handoff here, so neither side can miss it
+                published = self._publish_listening_resource(pubsub)
+                #
+                if not published:
                     break
                 #
-                # Published so an aborted start can close the exact active subscription
-                self.redis_pubsub = pubsub
                 self.listening_ready_event.set()
                 #
                 for message in pubsub.listen():
@@ -182,9 +184,9 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
                 if self.running:
                     time.sleep(self.retry_interval)
             finally:
-                self.redis_pubsub = None
-                #
-                if pubsub is not None:
+                # Exactly one side closes: whoever takes the handoff, or us if it never happened
+                if pubsub is not None and \
+                        (self._take_listening_resource() is not None or not published):
                     try:
                         pubsub.close()  # TODO: handle redis errors
                     except:  # pylint: disable=W0702

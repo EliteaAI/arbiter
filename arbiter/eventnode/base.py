@@ -79,6 +79,10 @@ class EventNodeBase:  # pylint: disable=R0902
         self.stop_event = threading.Event()
         self.event_lock = threading.Lock()
         #
+        # Guards the handoff of the live listening resource between worker and cleanup
+        self.transport_lock = threading.Lock()
+        self.listening_resource = None
+        #
         self.queue_get_timeout = 1
         #
         # None means "wait forever": ZeroMQ mesh peers may legitimately be down at boot,
@@ -182,7 +186,7 @@ class EventNodeBase:  # pylint: disable=R0902
         #
         self._run_bounded("connect", connect, deadline)
 
-    def _run_bounded(self, stage, target, deadline, args=()):
+    def _run_bounded(self, stage, target, deadline, args=(), settle=True):  # pylint: disable=R0913
         """ Run a blocking transport call without letting it outlast the deadline """
         timeout = self._time_left(deadline)
         #
@@ -202,7 +206,8 @@ class EventNodeBase:  # pylint: disable=R0902
         thread.start()
         thread.join(timeout)
         #
-        if thread.is_alive():
+        # No settle grace when the deadline is a shared budget: it would overspend it
+        if thread.is_alive() and settle:
             thread.join(self.deadline_settle_wait)
         #
         if thread.is_alive():
@@ -240,31 +245,31 @@ class EventNodeBase:  # pylint: disable=R0902
         self.can_emit = False
         self.stop_event.set()
         #
+        # One budget for the whole cleanup: closing and joining share it, not one each
+        deadline = time.monotonic() + self.cleanup_max_wait
+        #
         if self.close_transport_before_join:
-            self._close_transport_bounded()
-            self._join_workers(self.cleanup_max_wait)
+            self._close_transport_bounded(deadline)
+            self._join_workers(deadline)
         else:
-            self._join_workers(self.cleanup_max_wait)
-            self._close_transport_bounded()
+            self._join_workers(deadline)
+            self._close_transport_bounded(deadline)
         #
         self._detach_application_state()
 
-    def _close_transport_bounded(self):
+    def _close_transport_bounded(self, deadline):
         """ Release the transport without letting a stuck close hold up the failure """
         try:
-            self._run_bounded(
-                "close", self._close_transport, time.monotonic() + self.cleanup_max_wait,
-            )
+            self._run_bounded("close", self._close_transport, deadline, settle=False)
         except:  # pylint: disable=W0702
             if self.log_errors:
                 log.exception("Failed to close transport on aborted start")
 
-    def _join_workers(self, timeout):
+    def _join_workers(self, deadline):
         """ Bounded join of worker threads, naming the ones that could not be stopped """
         threads = list(self.emitting_threads or []) + \
             [self.listening_thread] + list(self.callback_threads)
         #
-        deadline = time.monotonic() + timeout
         stuck = []
         #
         for thread in threads:
@@ -278,7 +283,8 @@ class EventNodeBase:  # pylint: disable=R0902
         #
         if stuck and self.log_errors:
             log.warning(
-                "Event node workers did not stop in %ss: %s", timeout, ", ".join(stuck)
+                "Event node workers did not stop within the %ss cleanup budget: %s",
+                self.cleanup_max_wait, ", ".join(stuck),
             )
         #
         return stuck
@@ -304,6 +310,23 @@ class EventNodeBase:  # pylint: disable=R0902
                     data_queue.get_nowait()
                 except queue.Empty:
                     break
+
+    def _publish_listening_resource(self, resource):
+        """ Offer the live listening resource to cleanup, refused if the node is already stopping """
+        with self.transport_lock:
+            if not self.running:
+                return False
+            #
+            self.listening_resource = resource
+            return True
+
+    def _take_listening_resource(self):
+        """ Take the published resource, so exactly one side ever releases it """
+        with self.transport_lock:
+            resource = self.listening_resource
+            self.listening_resource = None
+            #
+            return resource
 
     def _connect_transport(self, deadline):
         """ Connect transport before workers start, for backends that need it """
@@ -343,13 +366,18 @@ class EventNodeBase:  # pylint: disable=R0902
 
     def _wait_until_ready(self, worker_kind, ready_event, deadline):
         """ Wait for worker readiness, raise instead of blocking forever """
-        if ready_event.wait(self._time_left(deadline)):
-            return
+        if not ready_event.wait(self._time_left(deadline)):
+            raise EventNodeStartTimeout(
+                f"{type(self).__name__}: {worker_kind} worker not ready "
+                f"in {self.start_max_wait}s, cause: {self._describe_error(worker_kind)}"
+            )
         #
-        raise EventNodeStartTimeout(
-            f"{type(self).__name__}: {worker_kind} worker not ready "
-            f"in {self.start_max_wait}s, cause: {self._describe_error(worker_kind)}"
-        )
+        # The deadline is the contract, not the readiness flag: late readiness is still a failure
+        if self._deadline_expired(deadline):
+            raise EventNodeStartTimeout(
+                f"{type(self).__name__}: {worker_kind} worker became ready only after "
+                f"the {self.start_max_wait}s deadline"
+            )
 
     def _retry_sleep(self, deadline):
         """ Retry pause, never overshooting the start deadline """
