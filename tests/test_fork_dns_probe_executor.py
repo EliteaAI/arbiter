@@ -81,12 +81,36 @@ node = TaskNode(
     types.SimpleNamespace(can_emit=True, event_callbacks={}, catch_all_callbacks=[]),
     fork_dns_probe_enabled=os.environ["PROBE_ENABLED"] == "1",
     fork_dns_probe_timeout=0.3,
-    fork_dns_probe_resolver_timeout=0.3,
 )
+
+
+class MemorySink:
+    # Stands in for the caller-owned queue: memory transport only needs a put(), and a real
+    # Queue would be unreadable after the fork branch os._exit()s.
+    def __init__(self, path):
+        self.path = path
+
+    def put(self, value):
+        with open(self.path, "wb") as file:
+            file.write(value)
+
+    def close(self):
+        pass
+
+    def join_thread(self):
+        pass
+
+
+if os.environ["PROBE_TRANSPORT"] == "memory":
+    result_config = MemorySink(
+        os.path.join(os.environ["PROBE_RESULT_CONFIG"], "memory.bin")
+    )
+else:
+    result_config = os.environ["PROBE_RESULT_CONFIG"]
 
 node.executor(
     "probe_task", probe_target, os.environ["PROBE_TASK_ID"], {}, [7], {},
-    os.environ["PROBE_TRANSPORT"], os.environ["PROBE_RESULT_CONFIG"],
+    os.environ["PROBE_TRANSPORT"], result_config,
     os.environ["PROBE_CONTEXT"], None,
 )
 
@@ -116,6 +140,11 @@ def run_child(tmp_path, mode, transport="files", context="fork", enabled="1"):
 def read_result(tmp_path):
     """ Unpickle the file-transport result artifact the way the watcher does """
     return pickle.loads(gzip.decompress((tmp_path / f"{TASK_ID}.bin").read_bytes()))
+
+
+def read_memory_result(tmp_path):
+    """ Same for what the memory transport handed to the caller's queue """
+    return pickle.loads(gzip.decompress((tmp_path / "memory.bin").read_bytes()))
 
 
 class TestHealthyChild:
@@ -149,6 +178,19 @@ class TestPoisonedChild:
         with pytest.raises(Exception) as raised:
             node.get_task_result(TASK_ID)
         assert "ForkDnsUnusableError" in str(raised.value)
+
+    @staticmethod
+    def test_memory_transport_reports_the_failure_like_files_does(tmp_path):
+        # Memory transport is a put() on a queue the caller owns - no name resolution - so it
+        # must report normally. Only the events transport has to bail out.
+        completed = run_child(tmp_path, "poisoned", transport="memory")
+        assert completed.returncode == 0, completed.stderr
+        assert "MAKE_EVENT_NODE_WAS_CALLED" not in completed.stderr
+        assert "[task_startup]" in completed.stderr
+        #
+        result = read_memory_result(tmp_path)
+        assert "return" not in result
+        assert "arbiter.tasknode.tools.ForkDnsUnusableError" in result["raise"]
 
     @staticmethod
     def test_events_transport_exits_without_touching_the_event_node(tmp_path):
