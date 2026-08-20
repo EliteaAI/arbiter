@@ -89,6 +89,30 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
         #
         self.mute_first_failed_connections = mute_first_failed_connections
         self.failed_connections = 0
+        #
+        self.listening_connection = None
+        self.listening_channel = None
+
+    def stop(self):
+        """ Stop event node """
+        super().stop()
+        #
+        self._close_transport()
+
+    def _close_transport(self):
+        """ Ask the listening consumer to stop, if any """
+        connection, channel = self.listening_connection, self.listening_channel
+        # Cleared first so a second stop() cannot post a callback twice
+        self.listening_connection, self.listening_channel = None, None
+        #
+        if connection is None or channel is None:
+            return
+        #
+        # pika is not thread-safe: stop_consuming has to run on the connection's own thread
+        try:
+            connection.add_callback_threadsafe(channel.stop_consuming)
+        except:  # pylint: disable=W0702
+            pass
 
     def emit_data(self, data):
         """ Emit event data """
@@ -109,6 +133,7 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
     def listening_worker(self):
         """ Listening thread: push event data to sync_queue """
         while self.running:
+            connection = None
             try:
                 connection = self._get_connection()
                 channel = self._get_channel(connection)
@@ -124,18 +149,28 @@ class EventNode(EventNodeBase):  # pylint: disable=R0902
                     auto_ack=True
                 )
                 #
+                # Connecting can block for a long time: the node may be gone by now
+                if not self.running:
+                    break
+                #
+                # Published so an aborted start can stop this exact consumer
+                self.listening_connection, self.listening_channel = connection, channel
                 self.listening_ready_event.set()
                 #
                 channel.start_consuming()
             except:  # pylint: disable=W0702
                 self.record_worker_error("listening")
                 #
-                if self.log_errors:
+                if self.running and self.log_errors:
                     log.exception(
                         "Exception in listening thread. Retrying in %s seconds", self.retry_interval
                     )
-                time.sleep(self.retry_interval)
+                #
+                if self.running:
+                    time.sleep(self.retry_interval)
             finally:
+                self.listening_connection, self.listening_channel = None, None
+                #
                 try:
                     connection.close()
                 except:  # pylint: disable=W0702

@@ -130,22 +130,25 @@ class SocketIOEventNode(EventNodeBase):  # pylint: disable=R0902
         """ Listening thread: push event data to sync_queue """
         while self.running:
             try:
-                self.sio.on("eventnode_event", self._listening_callback)
+                sio = self.sio
+                #
+                # Cleared by an aborted start, and wait() must not resume after that
+                if sio is None or not self.running:
+                    break
+                #
+                sio.on("eventnode_event", self._listening_callback)
                 self.listening_ready_event.set()
-                self.sio.wait()
+                sio.wait()
             except:  # pylint: disable=W0702
                 self.record_worker_error("listening")
                 #
-                if self.log_errors:
+                if self.running and self.log_errors:
                     log.exception(
                         "Exception in listening thread. Retrying in %s seconds", self.retry_interval
                     )
-                time.sleep(self.retry_interval)
-            finally:
-                try:
-                    pass  # TODO: handle socketio errors
-                except:  # pylint: disable=W0702
-                    pass
+                #
+                if self.running:
+                    time.sleep(self.retry_interval)
 
     def _listening_callback(self, body):
         if self.data_base64:

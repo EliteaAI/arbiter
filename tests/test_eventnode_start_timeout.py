@@ -16,7 +16,10 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+import os
+import gc
 import time
+import weakref
 import threading
 
 import pytest  # pylint: disable=E0401
@@ -25,6 +28,10 @@ from arbiter.eventnode.base import EventNodeBase, EventNodeStartTimeout
 from arbiter.eventnode.redis import RedisEventNode
 from arbiter.eventnode.zeromq import ZeroMQEventNode
 from arbiter.eventnode.mock import MockEventNode
+from arbiter.eventnode.rabbitmq import EventNode as RabbitMQEventNode
+from arbiter.eventnode.socketio import SocketIOEventNode
+from arbiter.eventnode import socketio as socketio_node
+from arbiter.eventnode.tools import make_event_node
 
 
 class WedgedListenerNode(EventNodeBase):
@@ -33,6 +40,9 @@ class WedgedListenerNode(EventNodeBase):
     Stands in for the live failure: the listener is stuck inside subscribe()
     (glibc resolver, unreachable Redis, ...) so listening_ready_event is never set.
     """
+
+    # Short so the tests measure the timeout, not the cleanup bound behind it
+    cleanup_max_wait = 0.3
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -99,8 +109,67 @@ class FlakyConnectWedgedListenerNode(WedgedListenerNode):
         self._connect_with_retry("connect", connect, deadline)
 
 
+class BlockingConnectNode(EventNodeBase):
+    """ Node whose transport connect blocks inside a single call that never returns.
+
+    This is the #6279 mechanism on the connect path instead of the listener path: one
+    getaddrinfo() stuck behind a fork-inherited resolver lock, so a retry loop that only
+    inspects the deadline between attempts never gets to inspect it at all.
+    """
+
+    cleanup_max_wait = 0.3
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.release = threading.Event()
+        self.entered = threading.Event()
+
+    def _connect_transport(self, deadline):
+        self.entered.set()
+        self.release.wait()
+
+    def listening_worker(self):
+        self.listening_ready_event.set()
+
+
+class LateConnectNode(EventNodeBase):
+    """ Transport that does connect successfully, but only after the deadline passed """
+
+    cleanup_max_wait = 0.3
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.connect_delay = 0.4
+        self.connection = None
+
+    def _connect_transport(self, deadline):
+        time.sleep(self.connect_delay)
+        self.connection = object()
+
+    def _close_transport(self):
+        self.connection = None
+
+    def listening_worker(self):
+        self.listening_ready_event.set()
+
+
+class BlockingCloseNode(WedgedListenerNode):
+    """ Wedged listener whose cleanup blocks too, delaying delivery of the failure """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.close_entered = threading.Event()
+        self.close_release = threading.Event()
+
+    def _close_transport(self):
+        self.close_entered.set()
+        self.close_release.wait()
+
+
 class LateListenerNode(EventNodeBase):
     """ Listener that only reaches sync_queue after start() already gave up """
+
+    cleanup_max_wait = 0.3
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -289,6 +358,149 @@ class TestAbortedStartCleanup:
         assert node.sync_queue.empty() is True
 
 
+class TestBlockingOperationsAreBounded:
+    """ A single blocking call must not outlast the deadline it was given """
+
+    def test_blocking_connect_does_not_outlast_the_deadline(self):
+        node = BlockingConnectNode(start_max_wait=0.4)
+        #
+        elapsed, message = _timed_start(node)
+        #
+        assert node.entered.is_set() is True
+        # nothing releases connect here: only the deadline can have ended the wait
+        assert elapsed < 3
+        assert "connect did not return" in message
+        assert node.started is False
+        #
+        node.release.set()
+
+    def test_connection_arriving_after_the_deadline_is_released(self):
+        # It connects successfully, just too late. The late connection must not be left
+        # dangling: no later stop() knows about it, since start() already failed.
+        node = LateConnectNode(start_max_wait=0.1)
+        #
+        _timed_start(node)
+        #
+        assert node.started is False
+        #
+        # connect completes on its own thread only now
+        time.sleep(node.connect_delay + 0.3)
+        assert node.connection is None
+
+    def test_blocking_cleanup_does_not_delay_the_failure(self):
+        node = BlockingCloseNode(start_max_wait=0.3)
+        #
+        elapsed, message = _timed_start(node)
+        #
+        assert node.close_entered.is_set() is True
+        # neither the listener nor the cleanup is released before this assertion
+        assert elapsed < 3
+        assert "listening worker not ready" in message
+        #
+        node.close_release.set()
+        node.release.set()
+
+    def test_unbounded_start_still_connects_on_the_calling_thread(self):
+        # start_max_wait=None keeps the legacy path: no helper thread, no changed
+        # thread affinity for transports that care (ZeroMQ contexts, pika connections)
+        node = LateConnectNode(start_max_wait=None)
+        node.connect_delay = 0
+        connect_thread = []
+        #
+        original = node._connect_transport  # pylint: disable=W0212
+        #
+        def record(deadline):
+            connect_thread.append(threading.current_thread())
+            original(deadline)
+        #
+        node._connect_transport = record  # pylint: disable=W0212
+        node.start()
+        #
+        assert connect_thread == [threading.current_thread()]
+        #
+        node.stop()
+
+
+class TestWorkerCleanup:
+    """ A failed start must not leave workers holding the application graph """
+
+    def test_workers_terminate_within_the_cleanup_interval(self):
+        # Whenever the blocking primitive is releasable, cleanup must actually reap them
+        node = WedgedEmitterNode(start_max_wait=0.3)
+        #
+        _timed_start(node)
+        #
+        for thread in [node.listening_thread] + node.callback_threads + node.emitting_threads:
+            assert thread.is_alive() is False
+
+    def test_discarded_failed_node_becomes_collectible(self):
+        node = WedgedEmitterNode(start_max_wait=0.3)
+        #
+        _timed_start(node)
+        #
+        node_ref = weakref.ref(node)
+        del node
+        gc.collect()
+        #
+        assert node_ref() is None
+
+    def test_stuck_worker_does_not_pin_pre_start_subscribers(self):
+        # The listener here stays wedged forever, so the node itself cannot be collected.
+        # What must still be collectible is everything the application handed it.
+        class Subscriber:  # pylint: disable=R0903
+            def __init__(self):
+                self.payload = bytearray(1024 * 1024)
+
+            def on_event(self, event_name, payload):
+                _ = event_name, payload
+        #
+        subscriber = Subscriber()
+        subscriber_ref = weakref.ref(subscriber)
+        #
+        node = WedgedListenerNode(start_max_wait=0.3)
+        node.subscribe("some_event", subscriber.on_event)
+        node.subscribe(..., subscriber.on_event)
+        node.sync_queue.put(b"payload nobody will consume")
+        #
+        _timed_start(node)
+        #
+        assert node.listening_thread.is_alive() is True  # still wedged, as in the live case
+        #
+        del subscriber
+        gc.collect()
+        #
+        assert subscriber_ref() is None
+        assert node.sync_queue.empty() is True
+        #
+        node.release.set()
+
+    def test_repeated_failed_starts_do_not_accumulate_threads(self):
+        baseline = threading.active_count()
+        #
+        for _ in range(3):
+            node = WedgedEmitterNode(start_max_wait=0.3)
+            _timed_start(node)
+            del node
+        #
+        gc.collect()
+        #
+        assert threading.active_count() <= baseline + 1
+
+
+BOUNDED_BACKENDS = [
+    lambda timeout: RedisEventNode(host="127.0.0.1", start_max_wait=timeout),
+    lambda timeout: MockEventNode(start_max_wait=timeout),
+    lambda timeout: RabbitMQEventNode(
+        host="127.0.0.1", port=5672, user="u", password="p", start_max_wait=timeout,
+    ),
+    lambda timeout: SocketIOEventNode(
+        url="http://127.0.0.1", password="p", start_max_wait=timeout,
+    ),
+]
+
+BOUNDED_BACKEND_IDS = ["redis", "mock", "rabbitmq", "socketio"]
+
+
 class TestBackendDefaults:
     def test_zeromq_stays_unbounded(self):
         # The mesh connects to another pylon that may not be up yet
@@ -301,46 +513,79 @@ class TestBackendDefaults:
         assert node.start_max_wait is None
         assert node.clone_config["start_max_wait"] is None
 
-    @pytest.mark.parametrize("factory", [
-        lambda: RedisEventNode(host="127.0.0.1"),
-        lambda: MockEventNode(),
-    ], ids=["redis", "mock"])
+    @pytest.mark.parametrize("factory", BOUNDED_BACKENDS, ids=BOUNDED_BACKEND_IDS)
     def test_other_backends_are_bounded(self, factory):
-        node = factory()
+        node = factory(60.0)
         #
         assert node.start_max_wait == 60.0
         assert node.clone_config["start_max_wait"] == 60.0
 
-    def test_clone_keeps_the_configured_timeout(self):
-        node = RedisEventNode(host="127.0.0.1", start_max_wait=7.5)
+    @pytest.mark.parametrize("factory", BOUNDED_BACKENDS, ids=BOUNDED_BACKEND_IDS)
+    def test_clone_keeps_the_configured_timeout(self, factory):
+        node = factory(7.5)
         #
         assert node.clone().start_max_wait == 7.5
 
 
+class TestEnvironmentConfig:
+    @staticmethod
+    def _clean_env(monkeypatch, value):
+        for key in list(os.environ):
+            if key.startswith("EVENTNODE_"):
+                monkeypatch.delenv(key)
+        #
+        monkeypatch.setenv("EVENTNODE_TYPE", "MockEventNode")
+        monkeypatch.setenv("EVENTNODE_START_MAX_WAIT", value)
+
+    def test_finite_timeout_is_parsed(self, monkeypatch):
+        self._clean_env(monkeypatch, "12.5")
+        #
+        assert make_event_node().start_max_wait == 12.5
+
+    def test_none_keeps_the_unbounded_wait(self, monkeypatch):
+        self._clean_env(monkeypatch, "None")
+        #
+        assert make_event_node().start_max_wait is None
+
+
 class StubPubSub:
-    def __init__(self, block_event):
+    def __init__(self, block_event, listen_block=None):
         self.block_event = block_event
+        self.listen_block = listen_block
+        self.listen_entered = threading.Event()
+        self.closed = False
 
     def subscribe(self, *args, **kwargs):
         _ = args, kwargs
         self.block_event.wait()
 
     def listen(self):
+        self.listen_entered.set()
+        #
+        # Blocks like a real subscription would: only close() gets us out of here
+        if self.listen_block is not None:
+            self.listen_block.wait()
+        #
         return []
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class StubRedis:
     """ Redis stand-in whose subscribe() blocks, as getaddrinfo did in the live case """
 
-    def __init__(self, block_event):
+    def __init__(self, block_event, pubsub=None):
         self.block_event = block_event
+        self.stub_pubsub = pubsub
         self.closed = False
 
     def pubsub(self, *args, **kwargs):
         _ = args, kwargs
+        #
+        if self.stub_pubsub is not None:
+            return self.stub_pubsub
+        #
         return StubPubSub(self.block_event)
 
     def close(self):
@@ -361,6 +606,7 @@ class TestRedisNode:
         stub_redis, stub_pool = StubRedis(block_event), StubPool()
         #
         node = RedisEventNode(host="127.0.0.1", start_max_wait=0.5)
+        node.cleanup_max_wait = 0.3
         node._get_connection_and_pool = \
             lambda deadline=None: (stub_redis, stub_pool)  # pylint: disable=W0212
         #
@@ -376,3 +622,115 @@ class TestRedisNode:
         #
         block_event.set()
         node.stop()  # must not blow up after a failed start
+
+    def test_released_subscribe_does_not_enter_listen(self):
+        # subscribe() is what blocked in the live case. When it finally returns, start() has
+        # already failed, so the worker must not go on to block in listen() as well
+        block_event = threading.Event()
+        stub_pubsub = StubPubSub(block_event, listen_block=threading.Event())
+        stub_redis, stub_pool = StubRedis(block_event, pubsub=stub_pubsub), StubPool()
+        #
+        node = RedisEventNode(host="127.0.0.1", start_max_wait=0.4)
+        node.cleanup_max_wait = 0.3
+        node._get_connection_and_pool = \
+            lambda deadline=None: (stub_redis, stub_pool)  # pylint: disable=W0212
+        #
+        with pytest.raises(EventNodeStartTimeout):
+            node.start()
+        #
+        block_event.set()
+        node.listening_thread.join(timeout=5)
+        #
+        assert node.listening_thread.is_alive() is False
+        assert stub_pubsub.listen_entered.is_set() is False
+        assert stub_pubsub.closed is True
+
+
+class TestSocketIONode:
+    def test_blocking_connect_fails_start_and_leaves_no_connection(self, monkeypatch):
+        # The shipped path #6279 hit: connect() -> getaddrinfo() with no way back
+        release, entered = threading.Event(), threading.Event()
+        #
+        class StubSioClient:  # pylint: disable=R0903
+            def __init__(self, **kwargs):
+                _ = kwargs
+                self.disconnected = False
+
+            def connect(self, **kwargs):
+                _ = kwargs
+                entered.set()
+                release.wait()
+
+            def emit(self, *args, **kwargs):
+                _ = args, kwargs
+
+            def on(self, *args, **kwargs):
+                _ = args, kwargs
+
+            def wait(self):
+                pass
+
+            def disconnect(self):
+                self.disconnected = True
+        #
+        monkeypatch.setattr(socketio_node.socketio, "Client", StubSioClient)
+        #
+        node = SocketIOEventNode(url="http://127.0.0.1", password="p", start_max_wait=0.4)
+        node.cleanup_max_wait = 0.3
+        #
+        elapsed, message = _timed_start(node)
+        #
+        assert entered.is_set() is True
+        assert elapsed < 3  # nothing releases connect: only the deadline ended the wait
+        assert "connect did not return" in message
+        assert node.started is False
+        assert node.sio is None
+        #
+        # connect returns only now, long after start() gave up: it must release the client
+        release.set()
+        time.sleep(0.3)
+        assert node.sio is None
+
+
+class TestZeroMQNode:
+    @staticmethod
+    def _live_monitor_threads(node):
+        # Scoped to this node: other tests in the same process have monitors of their own
+        return [
+            thread for thread in threading.enumerate()
+            if thread.name == "eventnode-zmq-monitor" and getattr(thread, "node", None) is node
+        ]
+
+    def test_finite_timeout_releases_the_context(self):
+        # ZeroMQ readiness needs a real handshake, so an absent peer never sets it. Nothing
+        # is listening on these ports, which is exactly the no-peer boot case.
+        node = ZeroMQEventNode(
+            connect_sub="tcp://127.0.0.1:1",
+            connect_push="tcp://127.0.0.1:2",
+            topic="mesh",
+            start_max_wait=0.5,
+            connection_wait_interval=0.2,
+        )
+        node.cleanup_max_wait = 3.0
+        #
+        elapsed, message = _timed_start(node)
+        #
+        assert elapsed < 10
+        assert "worker not ready" in message
+        assert node.started is False
+        assert node.zmq_ctx is None  # context released, not leaked with the failed node
+        #
+        for thread in [node.listening_thread] + node.callback_threads + node.emitting_threads:
+            assert thread.is_alive() is False
+        #
+        assert node._has_pending_emits() is False  # pylint: disable=W0212
+        #
+        # monitor threads leave once the context is gone
+        deadline = time.time() + 5
+        while self._live_monitor_threads(node) and time.time() < deadline:
+            time.sleep(0.1)
+        #
+        assert self._live_monitor_threads(node) == []
+        #
+        node.stop()
+        node.stop()  # must not term an already-destroyed context

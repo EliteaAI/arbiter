@@ -35,6 +35,9 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
 
     socket_poll_timeout = 1000
 
+    # Socket close is not thread-safe: workers must leave the sockets before destroy()
+    close_transport_before_join = False
+
     def __init__(
             self, connect_sub, connect_push, topic="events", topic_format="[{}]",
             hmac_key=None, hmac_digest="sha512", callback_workers=1,
@@ -148,12 +151,37 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
         #
         self.zmq_ctx = zmq.Context()
 
+    def _close_transport(self):
+        """ Release ZeroMQ context, if any """
+        zmq_ctx = self.zmq_ctx
+        # Cleared first so a second stop() cannot term an already-terminated context
+        self.zmq_ctx = None
+        #
+        if zmq_ctx is None:
+            return
+        #
+        if not self.started:
+            # Aborted start: nothing worth flushing, and term() would wait for stuck workers
+            zmq_ctx.destroy(0)
+        elif self.shutdown_via_destroy:
+            zmq_ctx.destroy(self._get_shutdown_linger())
+        else:
+            zmq_ctx.term()
+
+    def _discard_queued_data(self):
+        """ Drop queued payloads, including the pending count the emitting loop watches """
+        super()._discard_queued_data()
+        #
+        with self.pending_emit_lock:
+            self.pending_emit_count = 0
+
     def stop(self):
         """ Stop event node """
         self.can_emit = False
         super().stop()
         #
-        if self.started:
+        # Context, not started flag: a partially started node still has one to release
+        if self.started or self.zmq_ctx is not None:
             log.debug("Stop initiated")
             #
             if self.shutdown_in_thread:
@@ -181,15 +209,14 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
                 if callback_thread.is_alive():
                     callback_thread.join(timeout=join_timeout)
         #
-        if self.shutdown_via_destroy:
-            self.zmq_ctx.destroy(self._get_shutdown_linger())
-        else:
-            self.zmq_ctx.term()
+        pending_emit_count = self.pending_emit_count
         #
-        if self.pending_emit_count > 0:
+        self._close_transport()
+        #
+        if pending_emit_count > 0:
             log.warning(
                 "ZeroMQ event node stopped with %s pending messages unsent",
-                self.pending_emit_count,
+                pending_emit_count,
             )
 
     def _get_shutdown_linger(self):
@@ -265,7 +292,12 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
         else:
             import zmq  # pylint: disable=C0415,E0401
         #
-        zmq_socket_push = self.zmq_ctx.socket(zmq.PUSH)  # pylint: disable=E1101
+        zmq_ctx = self.zmq_ctx
+        #
+        if zmq_ctx is None:  # aborted start released the context before this thread ran
+            return
+        #
+        zmq_socket_push = zmq_ctx.socket(zmq.PUSH)  # pylint: disable=E1101
         self._set_sockopts(zmq, zmq_socket_push)
         zmq_socket_push.connect(self.zeromq_connect_push)
         #
@@ -314,7 +346,12 @@ class ZeroMQEventNode(EventNodeBase):  # pylint: disable=R0902
         else:
             import zmq  # pylint: disable=C0415,E0401
         #
-        zmq_socket_sub = self.zmq_ctx.socket(zmq.SUB)  # pylint: disable=E1101
+        zmq_ctx = self.zmq_ctx
+        #
+        if zmq_ctx is None:  # aborted start released the context before this thread ran
+            return
+        #
+        zmq_socket_sub = zmq_ctx.socket(zmq.SUB)  # pylint: disable=E1101
         self._set_sockopts(zmq, zmq_socket_sub)
         zmq_socket_sub.connect(self.zeromq_connect_sub)
         zmq_socket_sub.subscribe(self.zeromq_topic)
@@ -370,7 +407,7 @@ class ZeroMQMonitorThread(threading.Thread):  # pylint: disable=R0903
     """ ZeroMQ: monitor """
 
     def __init__(self, node, monitor_socket, ready_event):
-        super().__init__(daemon=True)
+        super().__init__(daemon=True, name="eventnode-zmq-monitor")
         #
         self.node = node
         self.monitor_socket = monitor_socket
@@ -402,7 +439,9 @@ class ZeroMQMonitorThread(threading.Thread):  # pylint: disable=R0903
                     if event_data["event"] == zmq.EVENT_HANDSHAKE_SUCCEEDED:
                         self.ready_event.set()
             except Exception as exc:  # pylint: disable=W0718
-                if not isinstance(exc, zmq.error.ContextTerminated) and self.node.log_errors:
+                # A stopping node closes the monitored socket under us: not an error
+                if self.node.running and self.node.log_errors and \
+                        not isinstance(exc, zmq.error.ContextTerminated):
                     log.exception("Monitor exception")
         #
         log.debug("ZeroMQ monitoring thread stopping")

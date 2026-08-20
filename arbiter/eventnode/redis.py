@@ -112,6 +112,7 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
         #
         self.redis = None
         self.redis_pool = None
+        self.redis_pubsub = None
 
     def stop(self):
         """ Stop event node """
@@ -124,10 +125,17 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
         self.redis, self.redis_pool = self._get_connection_and_pool(deadline)
 
     def _close_transport(self):
-        """ Release redis connection and pool, if any """
-        redis, redis_pool = self.redis, self.redis_pool
+        """ Release redis subscription, connection and pool, if any """
+        pubsub, redis, redis_pool = self.redis_pubsub, self.redis, self.redis_pool
         # Cleared first so a second stop() or an un-wedging listener cannot reuse them
-        self.redis, self.redis_pool = None, None
+        self.redis_pubsub, self.redis, self.redis_pool = None, None, None
+        #
+        # Closing the active subscription is what wakes a listener blocked in listen()
+        if pubsub is not None:
+            try:
+                pubsub.close()
+            except:  # pylint: disable=W0702
+                pass
         #
         if redis is not None:
             redis.close()
@@ -142,13 +150,23 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
     def listening_worker(self):
         """ Listening thread: push event data to sync_queue """
         while self.running:
+            pubsub = None
             try:
                 pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe(self.redis_event_queue)
                 #
+                # subscribe() can block for a long time: the node may be gone by now
+                if not self.running:
+                    break
+                #
+                # Published so an aborted start can close the exact active subscription
+                self.redis_pubsub = pubsub
                 self.listening_ready_event.set()
                 #
                 for message in pubsub.listen():
+                    if not self.running:
+                        break
+                    #
                     if not message:
                         continue
                     #
@@ -161,18 +179,16 @@ class RedisEventNode(EventNodeBase):  # pylint: disable=R0902
                         "Exception in listening thread. Retrying in %s seconds", self.retry_interval
                     )
                 #
-                try:
-                    pubsub.close()
-                except:  # pylint: disable=W0702
-                    pass
-                #
                 if self.running:
                     time.sleep(self.retry_interval)
             finally:
-                try:
-                    pubsub.close()  # TODO: handle redis errors
-                except:  # pylint: disable=W0702
-                    pass
+                self.redis_pubsub = None
+                #
+                if pubsub is not None:
+                    try:
+                        pubsub.close()  # TODO: handle redis errors
+                    except:  # pylint: disable=W0702
+                        pass
 
     def _get_connection_and_pool(self, deadline=None):
         def connect():
