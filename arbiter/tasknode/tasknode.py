@@ -45,6 +45,11 @@ from .housekeeper import TaskNodeHousekeeper
 from .watcher import TaskNodeWatcher
 from .tools import InterruptTaskThread
 from .tools import reap_zombies
+from .tools import ForkDnsUnusableError
+from .tools import probe_dns_usable
+from .tools import stderr_note
+from .tools import detach_resolving_log_handlers
+from .tools import resolve_fork_dns_probe_setting
 from ..tools.pylon import is_runtime_gevent
 
 
@@ -63,6 +68,8 @@ class TaskNode:  # pylint: disable=R0902,R0904
             task_approver=None,
             state_reply_authority=False, orphan_grace_period=300,
             orphan_batch_limit=300,
+            fork_dns_probe_enabled=True, fork_dns_probe_timeout=2.0,
+            **kwargs,
     ):
         self.event_node = event_node
         self.event_node_was_started = False
@@ -114,6 +121,18 @@ class TaskNode:  # pylint: disable=R0902,R0904
         self.started = False
         #
         self.task_approver = task_approver
+        #
+        self.fork_dns_probe_enabled = resolve_fork_dns_probe_setting(
+            "enabled", fork_dns_probe_enabled,
+        )
+        self.fork_dns_probe_timeout = resolve_fork_dns_probe_setting(
+            "timeout", fork_dns_probe_timeout,
+        )
+        #
+        # Tolerated on purpose: plugins are updated independently of the arbiter shipped
+        # in the image, and a TypeError here would stop the whole pylon from starting.
+        if kwargs:
+            log.warning("TaskNode: ignoring unsupported options: %s", sorted(kwargs))
 
     #
     # Node start and stop
@@ -1085,6 +1104,32 @@ class TaskNode:  # pylint: disable=R0902,R0904
             #
             raise
 
+    def _abort_task_startup(
+            self, task_id, result_transport, error, multiprocessing_context,
+    ):
+        """ Refuse a task before it runs, without resolving anything """
+        # Only ever a dedicated fork child: the steps below mutate process-global logging
+        # and can exit the process, which in-process would take the whole pylon with it.
+        if multiprocessing_context != "fork":
+            raise error
+        #
+        # Resolution-free from here on: eventnode log handlers publish to Redis, which needs
+        # a lookup a guarded process may no longer be able to make.
+        detach_resolving_log_handlers()
+        stderr_note(f"[task_startup] Aborting task {task_id}: {error}")
+        #
+        # The events transport ships the result over the event node, i.e. needs that same
+        # lookup - so exit instead of wedging in the reply. Safe: this is a dedicated child.
+        if result_transport == "events":
+            stderr_note(
+                f"[task_startup] result transport is 'events'; "
+                f"exiting task {task_id} without a result"
+            )
+            reap_zombies()
+            os._exit(1)  # pylint: disable=W0212
+        #
+        raise error
+
     def _executor__multiprocessing(
             self,
             name, target, task_id, meta, args, kwargs,
@@ -1138,6 +1183,18 @@ class TaskNode:  # pylint: disable=R0902,R0904
             )
             #
             try:
+                # Inside this try on purpose: the failure must serialize as {"raise": ...},
+                # and the outer handler logs - which needs DNS and would wedge.
+                if multiprocessing_context == "fork" and self.fork_dns_probe_enabled \
+                        and not probe_dns_usable(self.fork_dns_probe_timeout):
+                    self._abort_task_startup(
+                        task_id, result_transport, ForkDnsUnusableError(
+                            "DNS is unusable in this forked task: name resolution did "
+                            "not answer, aborting before it wedges unkillably"
+                        ),
+                        multiprocessing_context,
+                    )
+                #
                 output = target(*args, **kwargs)
                 data = {"return": output}
             except:  # pylint: disable=W0702
