@@ -319,8 +319,21 @@ def run_forked_child(tmp_path, hold_lock):
     )
 
 
+# Only this class forks in-process; everything above plays the child role directly in a
+# fresh interpreter, so it stays portable.
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
 class TestRealForkWithInheritedLock:
     @staticmethod
+    @pytest.mark.skipif(
+        sys.platform == "darwin",
+        # Not a Linux-vs-macOS disagreement about the guard: the harness cannot be built
+        # this way on Darwin at all. Reaching the inherited lock requires a second thread
+        # alive at fork, and the ObjC runtime deliberately SIGABRTs a child forked from a
+        # multi-threaded process (objc_initializeAfterForkError), before arbiter runs. The
+        # negative control forks single-threaded, so it stays enabled everywhere. The bug
+        # itself is a glibc NSS/resolver mutex, which Darwin does not have.
+        reason="Darwin aborts a child forked from a multi-threaded process",
+    )
     def test_a_lock_inherited_across_a_real_fork_is_detected_and_reported(tmp_path):
         completed = run_forked_child(tmp_path, hold_lock=True)
         assert "CHILD_EXIT 0" in completed.stdout, completed.stderr
