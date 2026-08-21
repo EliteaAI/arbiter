@@ -62,8 +62,8 @@ class ForkDnsUnusableError(TaskStartupError):
     pass  # pylint: disable=W0107
 
 
-# Redundant while the resolver leg runs (that one walks the same nsswitch/hosts/resolv.conf
-# path first); this is the guard that remains when calibration drops the resolver leg.
+# The leg that needs no network at all: a stall here has no latency explanation, so it is
+# the unambiguous inherited-lock signal and it names which layer stalled in the note.
 FORK_DNS_PROBE_TARGETS = (
     ("localhost", 80),
 )
@@ -83,10 +83,6 @@ FORK_DNS_PROBE_DEFAULTS = {
     "enabled": True,
     "timeout": 2.0,
 }
-
-# Cap for the parent-side calibration: a resolver slower than this cannot tell a wedged
-# child from a healthy one, so the resolver leg is dropped instead of firing at random.
-FORK_DNS_CALIBRATE_TIMEOUT = 0.5
 
 
 def validate_probe_setting(name, raw, default):
@@ -153,7 +149,7 @@ def detach_resolving_log_handlers():
         pass
 
 
-def probe_dns_usable(timeout=2.0, probe_resolver=True):
+def probe_dns_usable(timeout=2.0):
     """ True if getaddrinfo still works in this process """
     # On a throwaway thread, not under SIGALRM: a Python signal handler never fires on a
     # C-level futex deadlock, but join() on a wedged thread does return.
@@ -169,11 +165,10 @@ def probe_dns_usable(timeout=2.0, probe_resolver=True):
         #
         local_done.append(True)
         #
-        if probe_resolver:
-            try:
-                socket.getaddrinfo(*FORK_DNS_RESOLVER_PROBE_TARGET)
-            except:  # pylint: disable=W0702
-                pass
+        try:
+            socket.getaddrinfo(*FORK_DNS_RESOLVER_PROBE_TARGET)
+        except:  # pylint: disable=W0702
+            pass
         #
         finished.append(True)
     #
@@ -185,32 +180,11 @@ def probe_dns_usable(timeout=2.0, probe_resolver=True):
     if finished:
         return True
     #
-    # Which leg stalled is diagnostic only: a calibrated resolver answers in well under a
-    # millisecond, so either stall leaves this child unusable.
+    # Which leg stalled is diagnostic only: a healthy resolver answers in well under a
+    # millisecond (measured), so either stall leaves this child unusable.
     stderr_note(
         "[fork_dns_probe] no answer in %ss, stalled on the %s lookups" % (
             timeout, "resolver" if local_done else "local",
         )
     )
     return False
-
-
-def resolver_probe_usable(timeout=FORK_DNS_CALIBRATE_TIMEOUT):
-    """ Whether the resolver target answers fast enough here to mean anything in a child """
-    # Run in the parent, where DNS is known healthy: a deployment whose resolver drops
-    # NXDOMAIN would otherwise make the resolver leg abort every healthy fork.
-    done = []
-    #
-    def _probe():
-        try:
-            socket.getaddrinfo(*FORK_DNS_RESOLVER_PROBE_TARGET)
-        except:  # pylint: disable=W0702
-            pass
-        #
-        done.append(True)
-    #
-    thread = threading.Thread(target=_probe, name="fork_dns_calibrate", daemon=True)
-    thread.start()
-    #
-    thread.join(timeout)
-    return bool(done)

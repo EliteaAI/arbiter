@@ -221,3 +221,121 @@ class TestProbeGating:
         assert "EXECUTOR_RETURNED" in completed.stdout
         assert read_result(tmp_path) == {"return": {"ran": True, "value": 7}}
         assert "[task_startup]" not in completed.stderr
+
+
+# Roman's third-round point: everything above plays the part of the fork child in a fresh
+# interpreter, so no parent state ever crosses a real fork boundary. This one does. The
+# parent parks a thread *inside* getaddrinfo holding the resolver lock, then forks - the
+# actual precondition of #6245 - and the child inherits that lock with no owner present.
+FORKED_LOCK_SCRIPT = """
+import os
+import socket
+import sys
+import threading
+import types
+
+sys.path.insert(0, os.environ["PROBE_REPO_ROOT"])
+
+_resolver_lock = threading.Lock()
+_holding = threading.Event()
+_forever = threading.Event()
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _locking_getaddrinfo(*args, **kwargs):
+    # Stands in for the private glibc NSS mutex: in the child this lock is already held and
+    # its owner thread does not exist there, so acquire() is an unwakeable futex wait.
+    _resolver_lock.acquire()
+    try:
+        return _real_getaddrinfo(*args, **kwargs)
+    finally:
+        _resolver_lock.release()
+
+
+def _park_inside_getaddrinfo():
+    _resolver_lock.acquire()
+    _holding.set()
+    _forever.wait()
+
+
+socket.getaddrinfo = _locking_getaddrinfo
+
+if os.environ["PROBE_HOLD_LOCK"] == "1":
+    threading.Thread(target=_park_inside_getaddrinfo, daemon=True).start()
+    assert _holding.wait(10), "holder thread never entered the resolver"
+
+from arbiter.tasknode import tasknode as tasknode_module
+from arbiter.tasknode.tasknode import TaskNode
+
+
+def _forbidden_make_event_node(*args, **kwargs):
+    sys.stderr.write("MAKE_EVENT_NODE_WAS_CALLED\\n")
+    sys.stderr.flush()
+    raise AssertionError("make_event_node must not be called on the abort path")
+
+
+tasknode_module.make_event_node = _forbidden_make_event_node
+sys.modules["tasknode_task"] = types.ModuleType("tasknode_task")
+
+
+def probe_target(value):
+    return {"ran": True, "value": value}
+
+
+node = TaskNode(
+    types.SimpleNamespace(can_emit=True, event_callbacks={}, catch_all_callbacks=[]),
+    fork_dns_probe_timeout=0.3,
+)
+
+pid = os.fork()
+
+if pid == 0:
+    try:
+        node.executor(
+            "probe_task", probe_target, os.environ["PROBE_TASK_ID"], {}, [7], {},
+            "files", os.environ["PROBE_RESULT_CONFIG"], "fork", None,
+        )
+    except BaseException:  # pylint: disable=W0703
+        os._exit(9)
+    os._exit(8)
+
+_, status = os.waitpid(pid, 0)
+print("CHILD_EXIT", os.waitstatus_to_exitcode(status))
+"""
+
+
+def run_forked_child(tmp_path, hold_lock):
+    """ Fork for real, with or without a parent thread parked inside the resolver """
+    env = dict(os.environ)
+    env.update({
+        "PROBE_REPO_ROOT": REPO_ROOT,
+        "PROBE_HOLD_LOCK": "1" if hold_lock else "0",
+        "PROBE_TASK_ID": TASK_ID,
+        "PROBE_RESULT_CONFIG": str(tmp_path),
+    })
+    return subprocess.run(  # pylint: disable=W1510
+        [sys.executable, "-c", FORKED_LOCK_SCRIPT],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
+    )
+
+
+class TestRealForkWithInheritedLock:
+    @staticmethod
+    def test_a_lock_inherited_across_a_real_fork_is_detected_and_reported(tmp_path):
+        completed = run_forked_child(tmp_path, hold_lock=True)
+        assert "CHILD_EXIT 0" in completed.stdout, completed.stderr
+        assert "[task_startup]" in completed.stderr
+        #
+        result = read_result(tmp_path)
+        assert "return" not in result
+        assert "arbiter.tasknode.tools.ForkDnsUnusableError" in result["raise"]
+
+    @staticmethod
+    def test_the_same_fork_without_a_held_lock_runs_normally(tmp_path):
+        # The false-positive half: identical code path, identical patched resolver, only the
+        # parked holder thread removed. Anything but a clean run here means the guard fires
+        # on the wrapper rather than on the inherited lock.
+        completed = run_forked_child(tmp_path, hold_lock=False)
+        assert "CHILD_EXIT 0" in completed.stdout, completed.stderr
+        assert "[task_startup]" not in completed.stderr
+        assert read_result(tmp_path) == {"return": {"ran": True, "value": 7}}

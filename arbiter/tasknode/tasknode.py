@@ -50,8 +50,6 @@ from .tools import probe_dns_usable
 from .tools import stderr_note
 from .tools import detach_resolving_log_handlers
 from .tools import resolve_fork_dns_probe_setting
-from .tools import resolver_probe_usable
-from .tools import FORK_DNS_CALIBRATE_TIMEOUT
 from ..tools.pylon import is_runtime_gevent
 
 
@@ -130,8 +128,6 @@ class TaskNode:  # pylint: disable=R0902,R0904
         self.fork_dns_probe_timeout = resolve_fork_dns_probe_setting(
             "timeout", fork_dns_probe_timeout,
         )
-        # Calibrated in start(), where DNS is known healthy; children inherit the verdict
-        self.fork_dns_probe_resolver = True
         #
         # Tolerated on purpose: plugins are updated independently of the arbiter shipped
         # in the image, and a TypeError here would stop the whole pylon from starting.
@@ -142,27 +138,12 @@ class TaskNode:  # pylint: disable=R0902,R0904
     # Node start and stop
     #
 
-    def calibrate_fork_dns_probe(self):
-        """ Decide once whether the resolver leg can discriminate in this deployment """
-        if resolver_probe_usable():
-            return
-        #
-        # Fail safe rather than fail loud: the local lookups still catch the inherited lock
-        self.fork_dns_probe_resolver = False
-        log.warning(
-            "Fork DNS probe: the resolver did not answer within %ss here, so forked tasks "
-            "are guarded by the local lookups only", FORK_DNS_CALIBRATE_TIMEOUT,
-        )
-
     def start(self, block=False):
         """ Start task node """
         if self.started:
             return
         #
         self.stop_event.clear()
-        #
-        if self.multiprocessing_context == "fork" and self.fork_dns_probe_enabled:
-            self.calibrate_fork_dns_probe()
         #
         if not self.event_node.started:
             self.event_node.start()
@@ -1205,10 +1186,7 @@ class TaskNode:  # pylint: disable=R0902,R0904
                 # Inside this try on purpose: the failure must serialize as {"raise": ...},
                 # and the outer handler logs - which needs DNS and would wedge.
                 if multiprocessing_context == "fork" and self.fork_dns_probe_enabled \
-                        and not probe_dns_usable(
-                            self.fork_dns_probe_timeout,
-                            self.fork_dns_probe_resolver,
-                        ):
+                        and not probe_dns_usable(self.fork_dns_probe_timeout):
                     self._abort_task_startup(
                         task_id, result_transport, ForkDnsUnusableError(
                             "DNS is unusable in this forked task: name resolution did "

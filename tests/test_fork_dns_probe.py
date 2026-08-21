@@ -22,9 +22,9 @@ import threading
 
 import pytest  # pylint: disable=E0401,W0611
 
+from arbiter.eventnode.mock import MockEventNode
 from arbiter.tasknode.tasknode import TaskNode
 from arbiter.tasknode.tools import (
-    FORK_DNS_CALIBRATE_TIMEOUT,
     FORK_DNS_PROBE_ENV_PREFIX,
     FORK_DNS_PROBE_TARGETS,
     FORK_DNS_RESOLVER_PROBE_TARGET,
@@ -33,7 +33,6 @@ from arbiter.tasknode.tools import (
     TaskStartupError,
     detach_resolving_log_handlers,
     probe_dns_usable,
-    resolver_probe_usable,
     stderr_note,
 )
 
@@ -71,7 +70,7 @@ class TestProbeTargets:
     @staticmethod
     def test_the_local_leg_needs_no_network():
         # localhost still opens nsswitch.conf, resolv.conf, /etc/hosts and the nscd socket
-        # (measured), so a hang here is an inherited lock - it just sends no packet.
+        # (measured), so a hang here is an inherited lock with no latency explanation.
         hosts = [host for host, _ in FORK_DNS_PROBE_TARGETS]
         assert hosts == ["localhost"]
         assert FORK_DNS_RESOLVER_PROBE_TARGET[0] not in hosts
@@ -87,8 +86,8 @@ class TestProbeTargets:
 
     @staticmethod
     def test_the_resolver_leg_is_separate_from_the_local_one():
-        # Kept as its own constant so calibration can drop it independently. It is also the
-        # only leg that dlopens an NSS module, i.e. the only one exercising _dl_load_lock.
+        # The only leg that reaches the resolver, and the only one that dlopens an NSS
+        # module - i.e. the only one exercising _dl_load_lock, a distinct deadlock.
         assert ".invalid" in FORK_DNS_RESOLVER_PROBE_TARGET[0]
 
     @staticmethod
@@ -113,9 +112,9 @@ class TestProbeDnsUsable:
     def test_a_resolver_slower_than_the_budget_is_treated_as_unusable(monkeypatch):
         # Deliberate, and the reason the budget is one number instead of two: no timeout can
         # prove a mutex, so the guard measures against what healthy costs here instead. A
-        # calibrated resolver answers this target in well under a millisecond (0.33ms median
+        # healthy resolver answers this target in well under a millisecond (0.33ms median
         # measured on a live cluster), so anything near the budget leaves the child unusable
-        # either way. The fleet-wide-misfire risk is handled by calibration, not by waiting.
+        # either way. A deployment that genuinely needs longer raises the env timeout.
         release = threading.Event()
         real_getaddrinfo = socket.getaddrinfo
 
@@ -127,24 +126,6 @@ class TestProbeDnsUsable:
         monkeypatch.setattr(socket, "getaddrinfo", wedged_network_target)
         try:
             assert probe_dns_usable(0.3) is False
-        finally:
-            release.set()
-
-    @staticmethod
-    def test_the_resolver_leg_can_be_skipped(monkeypatch):
-        # What calibration switches off in a deployment whose resolver cannot answer the
-        # probe target fast: the local lookups keep guarding, the resolver one is dropped.
-        release = threading.Event()
-        real_getaddrinfo = socket.getaddrinfo
-
-        def wedged_network_target(host, *args, **kwargs):
-            if host == FORK_DNS_RESOLVER_PROBE_TARGET[0]:
-                release.wait()
-            return real_getaddrinfo(host, *args, **kwargs)
-
-        monkeypatch.setattr(socket, "getaddrinfo", wedged_network_target)
-        try:
-            assert probe_dns_usable(0.3, probe_resolver=False) is True
         finally:
             release.set()
 
@@ -232,39 +213,53 @@ class TestAbortHelperIsForkOnly:
             logging.root.removeHandler(handler)
 
 
-class TestResolverCalibration:
+class TestForkingParentResolvesNoNames:
     @staticmethod
-    def test_a_resolver_that_cannot_answer_here_disables_its_leg(monkeypatch):
-        # Closes the one real deployment hole in the resolver leg: a resolver that drops
-        # NXDOMAIN answers slowly for every child, healthy or not, so the leg would abort
-        # the whole fork pool. Measured in the parent, where DNS is known to work.
-        release = threading.Event()
-        real_getaddrinfo = socket.getaddrinfo
-
-        def wedged_network_target(host, *args, **kwargs):
-            if host == FORK_DNS_RESOLVER_PROBE_TARGET[0]:
-                release.wait()
-            return real_getaddrinfo(host, *args, **kwargs)
-
-        monkeypatch.setattr(socket, "getaddrinfo", wedged_network_target)
-        node = TaskNode(None)
+    def test_start_performs_no_name_resolution(monkeypatch):
+        # The regression this replaces: an earlier revision calibrated the probe here, in the
+        # parent. On timeout that lookup could not be cancelled, so a thread stayed parked
+        # inside getaddrinfo for the process lifetime - and then the process forked. That is
+        # the precondition of the very bug being guarded against, manufactured by the guard.
+        # Counted rather than raised: every probe helper swallows exceptions by design, so an
+        # exploding stub would be caught and the call would go unnoticed.
+        calls = []
+        monkeypatch.setattr(
+            socket, "getaddrinfo", lambda *a, **k: calls.append(a) or [("fake",)],
+        )
+        node = TaskNode(
+            MockEventNode(), multiprocessing_context="fork", result_transport="memory",
+        )
         try:
-            node.calibrate_fork_dns_probe()
-            assert node.fork_dns_probe_resolver is False
+            node.start()
+            assert node.started
+            assert not calls, calls
+        finally:
+            node.stop()
+
+    @staticmethod
+    def test_no_probe_thread_survives_into_the_fork_window(monkeypatch):
+        # The same failure from the side that actually bit: a lookup that never returns. The
+        # parent cannot cancel it, so it must never have been started here in the first place.
+        release = threading.Event()
+
+        def blocked_getaddrinfo(*args, **kwargs):  # pylint: disable=W0613
+            release.wait()
+            raise socket.gaierror("blocked")
+
+        monkeypatch.setattr(socket, "getaddrinfo", blocked_getaddrinfo)
+        node = TaskNode(
+            MockEventNode(), multiprocessing_context="fork", result_transport="memory",
+        )
+        try:
+            node.start()
+            lingering = [
+                thread.name for thread in threading.enumerate()
+                if "fork_dns" in thread.name
+            ]
+            assert not lingering, lingering
         finally:
             release.set()
-
-    @staticmethod
-    def test_a_fast_resolver_keeps_its_leg(monkeypatch):
-        monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [("fake",)])
-        node = TaskNode(None)
-        node.calibrate_fork_dns_probe()
-        assert node.fork_dns_probe_resolver is True
-
-    @staticmethod
-    def test_calibration_verdict_is_a_boolean_not_a_duration(monkeypatch):
-        monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [("fake",)])
-        assert resolver_probe_usable(FORK_DNS_CALIBRATE_TIMEOUT) is True
+            node.stop()
 
 
 class TestTaskNodeOptions:
@@ -273,8 +268,6 @@ class TestTaskNodeOptions:
         node = TaskNode(None)
         assert node.fork_dns_probe_enabled is True
         assert node.fork_dns_probe_timeout == 2.0
-        # Calibration may clear this in start(); before that the leg is assumed usable.
-        assert node.fork_dns_probe_resolver is True
 
     @staticmethod
     def test_probe_options_are_configurable():
