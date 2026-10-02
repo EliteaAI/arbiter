@@ -580,6 +580,7 @@ class TaskNode:  # pylint: disable=R0902,R0904
             process = data.get("process", None)
         #
         if process is not None and process.is_alive():
+            data["stop_requested"] = True  # lets the watcher tell a stop from a crash
             if self.kill_on_stop:
                 process.kill()
             else:
