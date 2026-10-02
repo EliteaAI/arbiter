@@ -21,6 +21,7 @@
 
 import os
 import time
+import signal
 import datetime
 import threading
 import multiprocessing
@@ -229,6 +230,8 @@ class TaskNodeWatcher(threading.Thread):  # pylint: disable=R0903
             #
             try:
                 task_data["process"].join(1)
+                # close() drops exitcode; keep it to tell a crash/OOM from a stop
+                task_data["exitcode"] = task_data["process"].exitcode
                 task_data["process"].close()
             except:  # pylint: disable=W0702
                 log.exception("Failed to close process, continuing")
@@ -284,16 +287,36 @@ class TaskNodeWatcher(threading.Thread):  # pylint: disable=R0903
             #
             self._announce_task_stopped(task_id, task_data["result"])
 
+    @staticmethod
+    def _log_missing_result(task_id, task_data):
+        exitcode = task_data.get("exitcode", None)
+        if not exitcode:
+            return  # threading task, or a clean exit
+        #
+        try:
+            reason = signal.Signals(-exitcode).name if exitcode < 0 else f"exit {exitcode}"
+        except ValueError:
+            reason = f"exit {exitcode}"
+        #
+        if task_data.get("stop_requested", False):
+            log.info("Task %s stopped on request (%s), no result", task_id, reason)
+        else:
+            # SIGKILL here without a stop request is most likely the OOM killer
+            log.warning("Task %s died (%s) without producing a result", task_id, reason)
+
     def _announce_task_stopped(self, task_id, result):
         # Release the slot before anything that can raise: the caller swallows
         # exceptions, so a failure above this point would leak the task forever
         with self.node.lock:
             local_task = self.node.local_tasks.pop(task_id, None)
-            self.node.running_tasks.pop(task_id, None)
+            task_data = self.node.running_tasks.pop(task_id, None)
             if not self.node.running_tasks:
                 self.node.have_running_tasks.clear()
             #
             known_state = self.node.global_task_state.get(task_id, None)
+        #
+        if result is None and task_data is not None:
+            self._log_missing_result(task_id, task_data)
         #
         if known_state is not None:
             task_state = known_state.copy()
